@@ -146,10 +146,45 @@ async def get_summary(session_id: str):
 @app.get("/sessions/{session_id}/storyboard")
 async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=20000)):
     q = """
-    SELECT ts_utc, local_time, offset_s, source_clip, clip_offset_s, file_name, media_rel_path
-    FROM dashcam.storyboard_frame
-    WHERE drive_session_id = $1::uuid
-    ORDER BY ts_utc
+    SELECT
+      f.ts_utc,
+      f.local_time,
+      f.offset_s,
+      f.source_clip,
+      f.clip_offset_s,
+      f.file_name,
+      f.media_rel_path,
+      g.lat::double precision       AS lat,
+      g.lon::double precision       AS lon,
+      g.speed_mph::double precision AS speed_mph,
+      g.course_deg::double precision AS course_deg
+    FROM dashcam.storyboard_frame f
+    LEFT JOIN LATERAL (
+      WITH prev AS (
+        SELECT ts_utc, lat, lon, speed_mph, course_deg
+        FROM dashcam.v_gnss_valid
+        WHERE drive_session_id = f.drive_session_id AND ts_utc <= f.ts_utc
+        ORDER BY ts_utc DESC
+        LIMIT 1
+      ),
+      next AS (
+        SELECT ts_utc, lat, lon, speed_mph, course_deg
+        FROM dashcam.v_gnss_valid
+        WHERE drive_session_id = f.drive_session_id AND ts_utc >= f.ts_utc
+        ORDER BY ts_utc ASC
+        LIMIT 1
+      )
+      SELECT *
+      FROM (
+        SELECT * FROM prev
+        UNION ALL
+        SELECT * FROM next
+      ) t
+      ORDER BY abs(extract(epoch from (t.ts_utc - f.ts_utc)))
+      LIMIT 1
+    ) g ON TRUE
+    WHERE f.drive_session_id = $1::uuid
+    ORDER BY f.ts_utc
     LIMIT $2;
     """
     assert pool is not None
@@ -159,12 +194,10 @@ async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=2000
     out = []
     for r in rows:
         d = dict(r)
-        # Convert stored rel-path to a URL under /media
         rel = d.get("media_rel_path")
         d["url"] = f"/media/{rel}" if rel else None
         out.append(d)
     return out
-
 
 @app.get("/sessions/{session_id}/events")
 async def get_events(
