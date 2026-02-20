@@ -1,0 +1,431 @@
+--- a/api/main.py
++++ b/api/main.py
+@@ -146,10 +146,49 @@
+ @app.get("/sessions/{session_id}/storyboard")
+ async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=20000)):
+     q = """
+-    SELECT ts_utc, local_time, offset_s, source_clip, clip_offset_s, file_name, media_rel_path
+-    FROM dashcam.storyboard_frame
+-    WHERE drive_session_id = $1::uuid
+-    ORDER BY ts_utc
++    SELECT
++      f.ts_utc,
++      f.local_time,
++      f.offset_s,
++      f.source_clip,
++      f.clip_offset_s,
++      f.file_name,
++      f.media_rel_path,
++      g.ts_utc     AS gnss_ts_utc,
++      g.lat        AS lat,
++      g.lon        AS lon,
++      g.speed_mph  AS speed_mph,
++      g.course_deg AS course_deg,
++      abs(extract(epoch from (g.ts_utc - f.ts_utc)))::double precision AS gnss_dt_s
++    FROM dashcam.storyboard_frame f
++    LEFT JOIN LATERAL (
++      WITH prev AS (
++        SELECT ts_utc, lat, lon, speed_mph, course_deg
++        FROM dashcam.v_gnss_valid
++        WHERE drive_session_id = f.drive_session_id
++          AND ts_utc <= f.ts_utc
++        ORDER BY ts_utc DESC
++        LIMIT 1
++      ),
++      next AS (
++        SELECT ts_utc, lat, lon, speed_mph, course_deg
++        FROM dashcam.v_gnss_valid
++        WHERE drive_session_id = f.drive_session_id
++          AND ts_utc >= f.ts_utc
++        ORDER BY ts_utc ASC
++        LIMIT 1
++      )
++      SELECT *
++      FROM (
++        SELECT * FROM prev
++        UNION ALL
++        SELECT * FROM next
++      ) t
++      ORDER BY abs(extract(epoch from (t.ts_utc - f.ts_utc))) ASC
++      LIMIT 1
++    ) g ON true
++    WHERE f.drive_session_id = $1::uuid
++    ORDER BY f.ts_utc
+     LIMIT $2;
+     """
+     assert pool is not None
+     async with pool.acquire() as con:
+         rows = await con.fetch(q, session_id, limit)
+--- a/ui/index.html
++++ b/ui/index.html
+@@ -94,6 +94,28 @@
+     .thumb .cap {
+       padding:6px 10px;
+       font-size:11px;
+       color:var(--muted);
+       white-space:nowrap;
+       overflow:hidden;
+       text-overflow:ellipsis;
+       border-top:1px solid var(--border);
+     }
++
++    /* Summary params (collapsed + bounded) */
++    details.paramsDetails { margin-top: 8px; }
++    details.paramsDetails > summary {
++      cursor: pointer;
++      user-select: none;
++      color: var(--muted);
++      font-size: 12px;
++    }
++    .paramsBox {
++      margin-top: 6px;
++      max-height: 140px;
++      overflow: auto;
++      white-space: pre-wrap;
++      word-break: break-word;
++      background: rgba(0,0,0,0.12);
++      border: 1px solid var(--border);
++      border-radius: 12px;
++      padding: 8px 10px;
++      color: var(--muted);
++      font-size: 11px;
++      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++    }
+   </style>
+ </head>
+ <body>
+@@ -160,14 +182,6 @@
+         <div class="events" id="eventList"></div>
+       </div>
+ 
+-      <div class="card">
+-        <div class="row" style="justify-content:space-between;">
+-          <div><b>Clips</b></div>
+-          <div class="small" id="clipCount">—</div>
+-        </div>
+-        <div id="clipList" class="kv" style="margin-top:10px; max-height: 26vh; overflow:auto;"></div>
+-      </div>
+     </div>
+ 
+     <div class="right">
+@@ -206,6 +220,17 @@
+   async function apiGet(path) {
+     const r = await fetch(API + path);
+     if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${path}`);
+     return await r.json();
+   }
++
++  function escapeHtml(s) {
++    return String(s ?? "")
++      .replaceAll("&", "&amp;")
++      .replaceAll("<", "&lt;")
++      .replaceAll(">", "&gt;")
++      .replaceAll('"', "&quot;")
++      .replaceAll("'", "&#039;");
++  }
+ 
+   function fmtMi(mi) { return (mi == null) ? "—" : `${mi.toFixed(2)} mi`; }
+   function fmtMph(mph) { return (mph == null) ? "—" : `${mph.toFixed(0)} mph`; }
+@@ -265,6 +290,12 @@
+   // state
+-  let map, marker;
++  let map, marker;
++  let storyPopup = null;
++  const STORY_SRC_ID = "storyboard-src";
++  const STORY_LAYER_ID = "storyboard-layer";
++  const STORY_CLUSTER_LAYER_ID = "storyboard-clusters";
++  const STORY_CLUSTER_COUNT_LAYER_ID = "storyboard-cluster-count";
+   let currentSession = null;
+   let chartInitialized = false;
+@@ -338,9 +369,7 @@
+       const s = await apiGet(`/sessions/${sessionId}`);
+-      const clips = await apiGet(`/sessions/${sessionId}/clips`);
+       const track = await apiGet(`/sessions/${sessionId}/track`);
+ 
+       currentSession = s;
+-      setSessionMeta(s, clips);
+-      setClipList(clips);
++      setSessionMeta(s);
+@@ -452,25 +481,6 @@
+-  function setClipList(clips) {
+-    elClipCount.textContent = `(${clips.length})`;
+-    elClipList.innerHTML = clips.map(c => {
+-      const view = c.view || "—";
+-      const name = c.clip_name || "clip";
+-      const start = c.start_ts_utc ? c.start_ts_utc.replace("+00:00","Z") : "—";
+-      const end = c.end_ts_utc ? c.end_ts_utc.replace("+00:00","Z") : "—";
+-      return `<div style="padding:6px 0; border-bottom:1px solid var(--border);">
+-        <div><b>${name}</b> <span class="small">(${view})</span></div>
+-        <div class="small">${start} → ${end}</div>
+-      </div>`;
+-    }).join("");
+-  }
+-
+-  function setSessionMeta(s, clips) {
++  function setSessionMeta(s) {
+     const sync = s.time_sync || {};
+     elSessionMeta.innerHTML = `
+       <div><b>Session:</b> <span class="small">${s.drive_session_id}</span></div>
+@@ -479,7 +489,6 @@
+       <div><b>Start:</b> <span class="small">${s.start_ts_utc || "—"}</span></div>
+       <div><b>End:</b> <span class="small">${s.end_ts_utc || "—"}</span></div>
+       <div><b>time_sync:</b> <span class="small">slope=${(sync.slope ?? "—")} p95_ms=${(sync.residual_p95_ms ?? "—")}</span></div>
+-      <div><b>Clips:</b> <span class="small">${clips.length}</span></div>
+     `;
+   }
+@@ -521,7 +530,13 @@
+       <div><b>Stops:</b> ${sum.stops_count ?? 0} &nbsp; <b>Bumps:</b> ${sum.bump_count ?? 0}</div>
+       <div><b>Hard brake:</b> ${sum.hard_brake_count ?? 0} &nbsp; <b>Hard accel:</b> ${sum.hard_accel_count ?? 0} &nbsp; <b>Harsh turn:</b> ${sum.harsh_turn_count ?? 0}</div>
+-      <div class="small" style="margin-top:6px;">params: ${sum.params ? JSON.stringify(sum.params) : "—"}</div>
++      ${sum.params ? `
++        <details class="paramsDetails">
++          <summary>params</summary>
++          <pre class="paramsBox">${escapeHtml(JSON.stringify(sum.params, null, 2))}</pre>
++        </details>
++      ` : ``}
+     `;
+   }
+@@ -569,6 +584,174 @@
+   function setEventMarkers(events) {
+     const srcId = "events-src";
+     const layerId = "events-layer";
+@@ -732,6 +915,191 @@
+     map.on("mouseleave", layerId, onMapEventMouseLeave);
+   }
++
++  const onStoryboardPointClick = async (ev) => {
++    const f = ev.features && ev.features[0];
++    if (!f) return;
++
++    const p = f.properties || {};
++    const c = f.geometry?.coordinates;
++    const ts = p.ts_utc || "";
++    const url = p.url || "";
++    const speed = (p.speed_mph == null || p.speed_mph === "") ? null : Number(p.speed_mph);
++
++    // Update preview pane
++    if (url) {
++      elStoryPreviewEmpty.style.display = "none";
++      elStoryPreviewImg.style.display = "block";
++      elStoryPreviewImg.src = url;
++      elStoryOpenLink.style.display = "inline";
++      elStoryOpenLink.href = url;
++    }
++    elStoryPreviewTs.textContent = ts ? ts.replace("+00:00","Z") : "—";
++
++    // Jump scrub + chart cursor without calling /nearest
++    if (ts && c && c.length === 2) {
++      await jumpToTs(ts, { skipNearest: true, lon: c[0], lat: c[1], speedMph: speed, storyUrl: url });
++    }
++  };
++
++  const onStoryboardClusterClick = (e) => {
++    const feats = map.queryRenderedFeatures(e.point, { layers: [STORY_CLUSTER_LAYER_ID] });
++    const f = feats && feats[0];
++    if (!f) return;
++    const clusterId = f.properties && f.properties.cluster_id;
++    const coords = f.geometry && f.geometry.coordinates;
++    if (clusterId == null || !coords) return;
++    const src = map.getSource(STORY_SRC_ID);
++    if (!src || !src.getClusterExpansionZoom) return;
++    src.getClusterExpansionZoom(clusterId, (err, zoom) => {
++      if (err) return;
++      map.easeTo({ center: coords, zoom });
++    });
++  };
++
++  const onStoryboardMouseEnter = () => { if (map) map.getCanvas().style.cursor = "pointer"; };
++  const onStoryboardMouseLeave = () => { if (map) map.getCanvas().style.cursor = ""; };
++
++  function clearStoryboardMarkers() {
++    if (!map || !map.loaded()) return;
++    if (storyPopup) { storyPopup.remove(); storyPopup = null; }
++
++    try { map.off("click", STORY_LAYER_ID, onStoryboardPointClick); } catch {}
++    try { map.off("mouseenter", STORY_LAYER_ID, onStoryboardMouseEnter); } catch {}
++    try { map.off("mouseleave", STORY_LAYER_ID, onStoryboardMouseLeave); } catch {}
++    try { map.off("click", STORY_CLUSTER_LAYER_ID, onStoryboardClusterClick); } catch {}
++    try { map.off("mouseenter", STORY_CLUSTER_LAYER_ID, onStoryboardMouseEnter); } catch {}
++    try { map.off("mouseleave", STORY_CLUSTER_LAYER_ID, onStoryboardMouseLeave); } catch {}
++
++    if (map.getLayer(STORY_LAYER_ID)) map.removeLayer(STORY_LAYER_ID);
++    if (map.getLayer(STORY_CLUSTER_LAYER_ID)) map.removeLayer(STORY_CLUSTER_LAYER_ID);
++    if (map.getLayer(STORY_CLUSTER_COUNT_LAYER_ID)) map.removeLayer(STORY_CLUSTER_COUNT_LAYER_ID);
++    if (map.getSource(STORY_SRC_ID)) map.removeSource(STORY_SRC_ID);
++  }
++
++  function showStoryboardPopupAt(lon, lat, imgUrl, tsIso, speedMph) {
++    if (!map || lon == null || lat == null || !imgUrl) return;
++
++    if (storyPopup) { storyPopup.remove(); storyPopup = null; }
++    const mph = (speedMph == null || Number.isNaN(speedMph)) ? "—" : `${Math.round(speedMph)} mph`;
++
++    const html = `
++      <div style="font-size:12px;">
++        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;">${escapeHtml(String(tsIso).replace("+00:00","Z"))}</div>
++        <div style="color:#9fb0c0; margin:2px 0 6px 0;">${escapeHtml(mph)}</div>
++        <img src="${imgUrl}" style="width:240px; height:auto; border-radius:10px; display:block;" />
++      </div>`;
++
++    storyPopup = new maplibregl.Popup({ closeButton: true, closeOnClick: true, maxWidth: "270px" })
++      .setLngLat([lon, lat])
++      .setHTML(html)
++      .addTo(map);
++
++    map.easeTo({ center: [lon, lat], duration: 200 });
++  }
++
++  function setStoryboardMarkers(frames) {
++    if (!map || !map.loaded()) return;
++
++    clearStoryboardMarkers();
++
++    const features = (frames || [])
++      .filter(f => f.lon != null && f.lat != null && f.url)
++      .map(f => ({
++        type: "Feature",
++        geometry: { type: "Point", coordinates: [f.lon, f.lat] },
++        properties: {
++          ts_utc: f.ts_utc,
++          url: (f.url ? (API + f.url) : ""),
++          speed_mph: (f.speed_mph ?? "")
++        }
++      }));
++
++    if (!features.length) return;
++
++    map.addSource(STORY_SRC_ID, {
++      type: "geojson",
++      data: { type: "FeatureCollection", features },
++      cluster: true,
++      clusterRadius: 40,
++      clusterMaxZoom: 14
++    });
++
++    map.addLayer({
++      id: STORY_CLUSTER_LAYER_ID,
++      type: "circle",
++      source: STORY_SRC_ID,
++      filter: ["has", "point_count"],
++      paint: {
++        "circle-radius": 12,
++        "circle-stroke-width": 1,
++        "circle-opacity": 0.75
++      }
++    });
++
++    map.addLayer({
++      id: STORY_CLUSTER_COUNT_LAYER_ID,
++      type: "symbol",
++      source: STORY_SRC_ID,
++      filter: ["has", "point_count"],
++      layout: { "text-field": "{point_count_abbreviated}", "text-size": 12 }
++    });
++
++    map.addLayer({
++      id: STORY_LAYER_ID,
++      type: "circle",
++      source: STORY_SRC_ID,
++      filter: ["!", ["has", "point_count"]],
++      paint: {
++        "circle-radius": 4,
++        "circle-stroke-width": 1,
++        "circle-opacity": 0.85
++      }
++    });
++
++    map.off("click", STORY_CLUSTER_LAYER_ID, onStoryboardClusterClick);
++    map.on("click", STORY_CLUSTER_LAYER_ID, onStoryboardClusterClick);
++    map.on("mouseenter", STORY_CLUSTER_LAYER_ID, onStoryboardMouseEnter);
++    map.on("mouseleave", STORY_CLUSTER_LAYER_ID, onStoryboardMouseLeave);
++
++    map.off("click", STORY_LAYER_ID, onStoryboardPointClick);
++    map.on("click", STORY_LAYER_ID, onStoryboardPointClick);
++    map.on("mouseenter", STORY_LAYER_ID, onStoryboardMouseEnter);
++    map.on("mouseleave", STORY_LAYER_ID, onStoryboardMouseLeave);
++  }
+ 
+   async function initChart() {
+     // IMPORTANT: await Plotly init to avoid "Load twice" behavior
+@@ -1001,12 +1353,51 @@
+-  async function jumpToTs(tsIso) {
++  async function jumpToTs(tsIso, opts = {}) {
+     const tsMs = Date.parse(tsIso);
+     if (!Number.isFinite(tsMs)) return;
+ 
+     // clamp
+     const min = Number(elScrub.min), max = Number(elScrub.max);
+     const clamped = Math.min(max, Math.max(min, tsMs));
+ 
+-    elScrub.value = String(clamped);
+-    elScrubIso.textContent = new Date(clamped).toISOString();
+-    await fetchNearest(clamped);
++    const iso = new Date(clamped).toISOString();
++    elScrub.value = String(clamped);
++    elScrubIso.textContent = iso;
++
++    if (opts.lon != null && opts.lat != null && marker) {
++      marker.setLngLat([Number(opts.lon), Number(opts.lat)]);
++      if (map) map.easeTo({ center: [Number(opts.lon), Number(opts.lat)], duration: 200 });
++      if (opts.storyUrl) showStoryboardPopupAt(Number(opts.lon), Number(opts.lat), opts.storyUrl, iso, opts.speedMph);
++      const mph = (opts.speedMph == null || Number.isNaN(Number(opts.speedMph))) ? "—" : `${Math.round(Number(opts.speedMph))} mph`;
++      elNearestInfo.innerHTML = `
++        <div><b>GNSS:</b> <span class="small">${iso}  (${Number(opts.lat).toFixed(6)}, ${Number(opts.lon).toFixed(6)})  ${mph}</span></div>
++        <div><b>Accel:</b> <span class="small">—</span></div>
++        <div><b>Clip:</b> <span class="small">—</span></div>
++      `;
++    }
++
++    await setChartCursor(iso);
++
++    if (opts.skipNearest) return;
++
++    await fetchNearest(clamped);
+   }
+ 
+   function clearStoryboard() {
++    if (map && map.loaded()) clearStoryboardMarkers();
+     currentStoryboard = [];
+     elStoryCount.textContent = "—";
+     elStoryStatus.textContent = "—";
+@@ -1038,12 +1429,20 @@
+-        <div class="thumb" data-ts="${ts}" data-url="${url}">
++        <div class="thumb" data-ts="${ts}" data-url="${url}" data-lat="${(f.lat==null)?'':String(f.lat)}" data-lon="${(f.lon==null)?'':String(f.lon)}" data-speed="${(f.speed_mph==null)?'':String(f.speed_mph)}">
+           <img loading="lazy" src="${url}" alt="${cap}" />
+           <div class="cap">${cap}</div>
+         </div>`;
+     }).join("");
+ 
+     for (const node of elThumbGrid.querySelectorAll(".thumb")) {
+       node.addEventListener("click", async () => {
+         const ts = node.getAttribute("data-ts");
+         const url = node.getAttribute("data-url");
+@@ -1052,8 +1451,18 @@
+           elStoryOpenLink.href = url;
+         }
+         elStoryPreviewTs.textContent = ts ? ts.replace("+00:00","Z") : "—";
+-        if (ts) await jumpToTs(ts);
++        const latStr = node.getAttribute("data-lat");
++        const lonStr = node.getAttribute("data-lon");
++        const spdStr = node.getAttribute("data-speed");
++        const lat = latStr ? Number(latStr) : null;
++        const lon = lonStr ? Number(lonStr) : null;
++        const spd = spdStr ? Number(spdStr) : null;
++        if (ts && lon != null && lat != null && Number.isFinite(lon) && Number.isFinite(lat)) {
++          await jumpToTs(ts, { skipNearest: true, lon, lat, speedMph: spd, storyUrl: url });
++        } else if (ts) {
++          await jumpToTs(ts);
++        }
+       });
+     }
+@@ -1016,6 +1429,10 @@
+     elStoryStatus.textContent = "loaded";
+ 
++    // Map markers for storyboard frames
++    if (map && map.loaded()) setStoryboardMarkers(currentStoryboard);
++    else if (map) map.once("load", () => setStoryboardMarkers(currentStoryboard));
++
+     // render thumbs (click -> preview + jump)
+     elThumbGrid.innerHTML = currentStoryboard.map(f => {
+       const ts = f.ts_utc || "";
+       const url = f.url ? (API + f.url) : ""; // IMPORTANT: prefix API (UI runs on :8080)

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Local env / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Dashcam runtime/generated artifacts (adjust if you store these elsewhere)
+media/
+import/
+tmp/
+artifacts/
+
+# Docker / Postgres local volumes (common patterns)
+**/pgdata/
+**/postgres-data/
