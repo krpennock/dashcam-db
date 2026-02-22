@@ -525,31 +525,7 @@
 
     map.addSource(STORY_SRC_ID, {
       type: "geojson",
-      data: { type: "FeatureCollection", features },
-      cluster: true,
-      clusterRadius: 40,
-      clusterMaxZoom: 12
-    });
-
-    map.addLayer({
-      id: STORY_CLUSTER_LAYER_ID,
-      type: "circle",
-      source: STORY_SRC_ID,
-      filter: ["has", "point_count"],
-      paint: {
-        "circle-radius": 12,
-        "circle-stroke-width": 1,
-        "circle-opacity": 0.65,
-        "circle-color": "#365070"
-      }
-    });
-
-    map.addLayer({
-      id: STORY_CLUSTER_COUNT_LAYER_ID,
-      type: "symbol",
-      source: STORY_SRC_ID,
-      filter: ["has", "point_count"],
-      layout: { "text-field": "{point_count_abbreviated}", "text-size": 12 }
+      data: { type: "FeatureCollection", features }
     });
 
     map.addLayer({

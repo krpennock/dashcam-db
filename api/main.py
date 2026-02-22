@@ -160,27 +160,14 @@ async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=2000
       g.course_deg::double precision AS course_deg
     FROM dashcam.storyboard_frame f
     LEFT JOIN LATERAL (
-      WITH prev AS (
-        SELECT ts_utc, lat, lon, speed_mph, course_deg
-        FROM dashcam.v_gnss_valid
-        WHERE drive_session_id = f.drive_session_id AND ts_utc <= f.ts_utc
-        ORDER BY ts_utc DESC
-        LIMIT 1
-      ),
-      next AS (
-        SELECT ts_utc, lat, lon, speed_mph, course_deg
-        FROM dashcam.v_gnss_valid
-        WHERE drive_session_id = f.drive_session_id AND ts_utc >= f.ts_utc
-        ORDER BY ts_utc ASC
-        LIMIT 1
-      )
-      SELECT *
-      FROM (
-        SELECT * FROM prev
-        UNION ALL
-        SELECT * FROM next
-      ) t
-      ORDER BY abs(extract(epoch from (t.ts_utc - f.ts_utc)))
+      SELECT
+        gs.lat, gs.lon, gs.speed_mph, gs.course_deg
+      FROM dashcam.gnss_sample gs
+      WHERE gs.drive_session_id = f.drive_session_id
+        AND gs.lat IS NOT NULL AND gs.lon IS NOT NULL
+        AND (gs.fix_quality IS NULL OR gs.fix_quality >= 1)
+        AND (gs.rmc_status IS NULL OR gs.rmc_status = 'A')
+      ORDER BY abs(gs.t_rel_s - f.offset_s) NULLS LAST
       LIMIT 1
     ) g ON TRUE
     WHERE f.drive_session_id = $1::uuid
