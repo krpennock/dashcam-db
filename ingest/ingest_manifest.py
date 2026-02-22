@@ -4,7 +4,8 @@ import sys
 import shutil
 import csv
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from datetime import datetime, timedelta
 
 import psycopg
 
@@ -25,6 +26,15 @@ def _get_path(obj: Any, *keys: str):
         if cur is None:
             return None
     return cur
+
+
+def _parse_ts(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def main() -> None:
@@ -51,7 +61,6 @@ def main() -> None:
     # v2 style
     gnss_rel = _get_path(telem, "gnss", "path")
     accel_rel = _get_path(telem, "accel", "path")
-    nmea_rel = _get_path(telem, "nmea", "path")  # optional; not ingested right now
 
     # legacy style fallback
     if not gnss_rel and isinstance(telem, dict):
@@ -72,9 +81,9 @@ def main() -> None:
     if not accel_path.exists():
         raise SystemExit(f"Accel CSV not found: {accel_path}")
 
-    # Session times (optional in manifest; we'll backfill from GNSS if absent)
-    start_ts_utc = _get_path(m, "session_time", "start_ts_utc")
-    end_ts_utc = _get_path(m, "session_time", "end_ts_utc")
+    # Session times (optional)
+    start_ts_manifest = _parse_ts(_get_path(m, "session_time", "start_ts_utc"))
+    end_ts_manifest = _parse_ts(_get_path(m, "session_time", "end_ts_utc"))
 
     clips = m.get("clips", []) or []
 
@@ -97,21 +106,19 @@ def main() -> None:
             cur.execute("DELETE FROM dashcam.gnss_sample    WHERE drive_session_id = %s::uuid;", (sid,))
             cur.execute("DELETE FROM dashcam.clip           WHERE drive_session_id = %s::uuid;", (sid,))
 
-            # Upsert drive_session (store manifest start/end if present)
+            # Upsert drive_session (we will normalize start/end after GNSS staging)
             cur.execute(
                 """
                 INSERT INTO dashcam.drive_session (drive_session_id, vehicle_tag, notes, start_ts_utc, end_ts_utc)
                 VALUES (%s::uuid, %s, %s, %s, %s)
                 ON CONFLICT (drive_session_id)
                 DO UPDATE SET vehicle_tag = EXCLUDED.vehicle_tag,
-                              notes = EXCLUDED.notes,
-                              start_ts_utc = COALESCE(EXCLUDED.start_ts_utc, dashcam.drive_session.start_ts_utc),
-                              end_ts_utc   = COALESCE(EXCLUDED.end_ts_utc,   dashcam.drive_session.end_ts_utc);
+                              notes = EXCLUDED.notes;
                 """,
-                (sid, vehicle_tag, notes, start_ts_utc, end_ts_utc),
+                (sid, vehicle_tag, notes, start_ts_manifest, end_ts_manifest),
             )
 
-            # Insert clips (timestamps may be null; that's fine)
+            # Insert clips
             if clips:
                 cur.executemany(
                     """
@@ -123,8 +130,8 @@ def main() -> None:
                             sid,
                             c.get("channel"),
                             c.get("clip_name"),
-                            c.get("start_ts_utc"),
-                            c.get("end_ts_utc"),
+                            _parse_ts(c.get("start_ts_utc")) if isinstance(c.get("start_ts_utc"), str) else c.get("start_ts_utc"),
+                            _parse_ts(c.get("end_ts_utc")) if isinstance(c.get("end_ts_utc"), str) else c.get("end_ts_utc"),
                             (c.get("video") or {}).get("path") if isinstance(c.get("video"), dict) else c.get("video_path"),
                         )
                         for c in clips
@@ -132,77 +139,6 @@ def main() -> None:
                 )
 
             # --- GNSS stage load ---
-            # --- Storyboard thumbs (time-based) ---
-            # Expected: <drive_folder>/artifacts/thumbs/index.csv + jpg files
-            # Copies: /import -> /media/<vehicle_tag>/<sid>/thumbs/<file>
-            # Inserts: dashcam.storyboard_frame rows with media_rel_path
-            thumbs_dir = (base / 'artifacts' / 'thumbs').resolve()
-            thumbs_index = (thumbs_dir / 'index.csv').resolve()
-
-            media_root = Path('/media').resolve()
-            if thumbs_index.exists() and media_root.is_dir():
-                vehicle_safe = (vehicle_tag or 'unknown').strip() or 'unknown'
-                dest_dir = (media_root / vehicle_safe / str(sid) / 'thumbs').resolve()
-                dest_dir.mkdir(parents=True, exist_ok=True)
-
-                rows_to_insert = []
-
-                def _f(x):
-                    x = (x or '').strip()
-                    return float(x) if x else None
-
-                def _t(x):
-                    x = (x or '').strip()
-                    return x or None
-
-                with thumbs_index.open('r', encoding='utf-8', newline='') as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        file_name = _t(row.get('file'))
-                        ts_utc = _t(row.get('utc_time'))
-                        if not file_name or not ts_utc:
-                            continue
-
-                        src_file = (thumbs_dir / file_name).resolve()
-                        if not src_file.exists():
-                            continue
-
-                        dst_file = (dest_dir / file_name).resolve()
-                        shutil.copy2(src_file, dst_file)
-
-                        media_rel_path = f"{vehicle_safe}/{sid}/thumbs/{file_name}"
-
-                        rows_to_insert.append((
-                            sid,
-                            ts_utc,
-                            _t(row.get('local_time')),
-                            _f(row.get('offset_s')),
-                            _t(row.get('source_clip')),
-                            _f(row.get('clip_offset_s')),
-                            file_name,
-                            media_rel_path,
-                        ))
-
-                if rows_to_insert:
-                    cur.executemany(
-                        """
-                        INSERT INTO dashcam.storyboard_frame (
-                          drive_session_id, ts_utc, local_time, offset_s,
-                          source_clip, clip_offset_s, file_name, media_rel_path
-                        )
-                        VALUES (%s::uuid, %s::timestamptz, %s::timestamptz, %s,
-                                %s, %s, %s, %s)
-                        ON CONFLICT (drive_session_id, ts_utc)
-                        DO UPDATE SET
-                          local_time    = EXCLUDED.local_time,
-                          offset_s      = EXCLUDED.offset_s,
-                          source_clip   = EXCLUDED.source_clip,
-                          clip_offset_s = EXCLUDED.clip_offset_s,
-                          file_name     = EXCLUDED.file_name,
-                          media_rel_path= EXCLUDED.media_rel_path;
-                        """,
-                        rows_to_insert,
-                    )
             cur.execute("TRUNCATE dashcam.gnss_csv_stage;")
             with gnss_path.open("rb") as f:
                 with cur.copy("COPY dashcam.gnss_csv_stage FROM STDIN WITH (FORMAT csv, HEADER true)") as cp:
@@ -212,7 +148,48 @@ def main() -> None:
                             break
                         cp.write(chunk)
 
+            # Canonical session anchor:
+            # Prefer GNSS min utc_time; fallback to manifest start.
+            cur.execute(
+                """
+                SELECT
+                  min(NULLIF(utc_time,'')::timestamptz) AS min_utc,
+                  max(t_rel_s) AS max_rel_s
+                FROM dashcam.gnss_csv_stage;
+                """
+            )
+            min_utc, max_rel_s = cur.fetchone()
+
+            start_anchor = min_utc or start_ts_manifest
+            if start_anchor is None:
+                raise SystemExit("Unable to determine session start_ts_utc (no GNSS utc_time and no manifest session_time.start_ts_utc)")
+
+            if start_ts_manifest and min_utc:
+                delta = abs((start_ts_manifest - min_utc).total_seconds())
+                if delta > 2.0:
+                    print(
+                        f"WARNING: manifest start_ts_utc differs from GNSS min utc_time by {delta:.3f}s; using GNSS min utc_time",
+                        file=sys.stderr,
+                    )
+
+            end_anchor = None
+            if max_rel_s is not None:
+                end_anchor = start_anchor + timedelta(seconds=float(max_rel_s))
+            else:
+                end_anchor = end_ts_manifest
+
+            cur.execute(
+                """
+                UPDATE dashcam.drive_session
+                SET start_ts_utc = %s::timestamptz,
+                    end_ts_utc   = %s::timestamptz
+                WHERE drive_session_id = %s::uuid;
+                """,
+                (start_anchor, end_anchor, sid),
+            )
+
             # --- GNSS insert ---
+            # Canonical ts_utc computed from start + t_rel_s (NOT device utc_time)
             cur.execute(
                 """
                 INSERT INTO dashcam.gnss_sample (
@@ -232,7 +209,8 @@ def main() -> None:
                   %s::uuid,
                   s.ms,
                   s.t_rel_s,
-                  NULLIF(s.utc_time,'')::timestamptz,
+                  (SELECT ds.start_ts_utc FROM dashcam.drive_session ds WHERE ds.drive_session_id = %s::uuid)
+                    + (s.t_rel_s * interval '1 second'),
                   s.lat, s.lon,
                   s.speed_knots, s.speed_mps, s.speed_mph,
                   s.course_deg,
@@ -241,22 +219,6 @@ def main() -> None:
                   s.alt_m, s.geoid_sep_m,
                   NULLIF(s.date_ddmmyy,''), NULLIF(s.time_hhmmss,'')
                 FROM dashcam.gnss_csv_stage s;
-                """,
-                (sid,),
-            )
-
-            # If session_time was missing in manifest, backfill start/end from GNSS
-            cur.execute(
-                """
-                UPDATE dashcam.drive_session ds
-                SET start_ts_utc = COALESCE(ds.start_ts_utc, g.min_ts),
-                    end_ts_utc   = COALESCE(ds.end_ts_utc,   g.max_ts)
-                FROM (
-                  SELECT min(ts_utc) AS min_ts, max(ts_utc) AS max_ts
-                  FROM dashcam.gnss_sample
-                  WHERE drive_session_id = %s::uuid
-                ) g
-                WHERE ds.drive_session_id = %s::uuid;
                 """,
                 (sid, sid),
             )
@@ -272,8 +234,7 @@ def main() -> None:
                         cp.write(chunk)
 
             # --- Accel insert ---
-            # accel_csv_stage expected columns: abs_ms,t_rel_s,ax,ay,az,clip,idx,t_clip_ms
-            # ts_utc computed from drive_session.start_ts_utc + t_rel_s
+            # ts_utc computed from drive_session.start_ts_utc + t_rel_s (canonical)
             cur.execute(
                 """
                 INSERT INTO dashcam.accel_sample (
@@ -302,7 +263,157 @@ def main() -> None:
                 (sid, sid),
             )
 
-            # Derived refresh (summary, events, geo, etc.)
+            # --- Storyboard thumbs ---
+            # Prefer artifacts/thumbs/index.geojson (has geometry), fallback to index.csv.
+            thumbs_dir = (base / "artifacts" / "thumbs").resolve()
+            thumbs_csv = (thumbs_dir / "index.csv").resolve()
+            thumbs_geojson = (thumbs_dir / "index.geojson").resolve()
+
+            media_root = Path("/media").resolve()
+
+            if media_root.is_dir() and (thumbs_geojson.exists() or thumbs_csv.exists()):
+                vehicle_safe = (vehicle_tag or "unknown").strip() or "unknown"
+                dest_dir = (media_root / vehicle_safe / str(sid) / "thumbs").resolve()
+                dest_dir.mkdir(parents=True, exist_ok=True)
+
+                # start_dt for canonical storyboard timestamps
+                cur.execute("SELECT start_ts_utc FROM dashcam.drive_session WHERE drive_session_id = %s::uuid;", (sid,))
+                start_dt = cur.fetchone()[0]
+                if start_dt is None:
+                    raise SystemExit("drive_session.start_ts_utc is NULL; cannot compute storyboard ts_utc")
+
+                rows_to_insert = []
+
+                def _t(x):
+                    x = (x or "").strip()
+                    return x or None
+
+                def _f(x):
+                    x = (x or "").strip()
+                    return float(x) if x else None
+
+                if thumbs_geojson.exists():
+                    gj = json.loads(thumbs_geojson.read_text(encoding="utf-8"))
+                    for feat in (gj.get("features") or []):
+                        geom = feat.get("geometry") or {}
+                        props = feat.get("properties") or {}
+                        coords = geom.get("coordinates")
+
+                        if not (isinstance(coords, list) and len(coords) == 2):
+                            continue
+                        lon, lat = coords[0], coords[1]
+
+                        file_name = _t(props.get("file"))
+                        if not file_name:
+                            continue
+
+                        src_file = (thumbs_dir / file_name).resolve()
+                        if not src_file.exists():
+                            continue
+
+                        offset_s = props.get("offset_s")
+                        offset_s = float(offset_s) if offset_s is not None else None
+
+                        # Canonical ts_utc from start + offset_s
+                        if offset_s is not None:
+                            ts_utc = start_dt + timedelta(seconds=float(offset_s))
+                        else:
+                            ts_utc = _parse_ts(props.get("utc_time"))
+                            if ts_utc is None:
+                                continue
+
+                        dst_file = (dest_dir / file_name).resolve()
+                        shutil.copy2(src_file, dst_file)
+
+                        media_rel_path = f"{vehicle_safe}/{sid}/thumbs/{file_name}"
+
+                        rows_to_insert.append(
+                            (
+                                sid,
+                                ts_utc,
+                                _parse_ts(_t(props.get("local_time"))),
+                                offset_s,
+                                _t(props.get("source_clip")),
+                                float(props.get("clip_offset_s")) if props.get("clip_offset_s") is not None else None,
+                                file_name,
+                                media_rel_path,
+                                float(lat) if lat is not None else None,
+                                float(lon) if lon is not None else None,
+                                float(props.get("speed_mph")) if props.get("speed_mph") is not None else None,
+                                float(props.get("course_deg")) if props.get("course_deg") is not None else None,
+                            )
+                        )
+                else:
+                    # CSV fallback: no geometry; we still compute ts_utc from start+offset_s when present.
+                    with thumbs_csv.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            file_name = _t(row.get("file"))
+                            if not file_name:
+                                continue
+
+                            src_file = (thumbs_dir / file_name).resolve()
+                            if not src_file.exists():
+                                continue
+
+                            offset_s = _f(row.get("offset_s"))
+                            if offset_s is not None:
+                                ts_utc = start_dt + timedelta(seconds=float(offset_s))
+                            else:
+                                ts_utc = _parse_ts(_t(row.get("utc_time")))
+                                if ts_utc is None:
+                                    continue
+
+                            dst_file = (dest_dir / file_name).resolve()
+                            shutil.copy2(src_file, dst_file)
+
+                            media_rel_path = f"{vehicle_safe}/{sid}/thumbs/{file_name}"
+
+                            rows_to_insert.append(
+                                (
+                                    sid,
+                                    ts_utc,
+                                    _parse_ts(_t(row.get("local_time"))),
+                                    offset_s,
+                                    _t(row.get("source_clip")),
+                                    _f(row.get("clip_offset_s")),
+                                    file_name,
+                                    media_rel_path,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                )
+                            )
+
+                if rows_to_insert:
+                    cur.executemany(
+                        """
+                        INSERT INTO dashcam.storyboard_frame (
+                          drive_session_id, ts_utc, local_time, offset_s,
+                          source_clip, clip_offset_s, file_name, media_rel_path,
+                          lat, lon, speed_mph, course_deg
+                        )
+                        VALUES (%s::uuid, %s::timestamptz, %s::timestamptz, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s, %s)
+                        ON CONFLICT (drive_session_id, ts_utc)
+                        DO UPDATE SET
+                          local_time     = EXCLUDED.local_time,
+                          offset_s       = EXCLUDED.offset_s,
+                          source_clip    = EXCLUDED.source_clip,
+                          clip_offset_s  = EXCLUDED.clip_offset_s,
+                          file_name      = EXCLUDED.file_name,
+                          media_rel_path = EXCLUDED.media_rel_path,
+                          lat            = EXCLUDED.lat,
+                          lon            = EXCLUDED.lon,
+                          speed_mph      = EXCLUDED.speed_mph,
+                          course_deg     = EXCLUDED.course_deg;
+                        """,
+                        rows_to_insert,
+                    )
+
+            # Derived refresh
             if derived_params is None:
                 cur.execute("SELECT dashcam.refresh_derived(%s::uuid);", (sid,))
             else:

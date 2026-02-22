@@ -146,32 +146,11 @@ async def get_summary(session_id: str):
 @app.get("/sessions/{session_id}/storyboard")
 async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=20000)):
     q = """
-    SELECT
-      f.ts_utc,
-      f.local_time,
-      f.offset_s,
-      f.source_clip,
-      f.clip_offset_s,
-      f.file_name,
-      f.media_rel_path,
-      g.lat::double precision       AS lat,
-      g.lon::double precision       AS lon,
-      g.speed_mph::double precision AS speed_mph,
-      g.course_deg::double precision AS course_deg
-    FROM dashcam.storyboard_frame f
-    LEFT JOIN LATERAL (
-      SELECT
-        gs.lat, gs.lon, gs.speed_mph, gs.course_deg
-      FROM dashcam.gnss_sample gs
-      WHERE gs.drive_session_id = f.drive_session_id
-        AND gs.lat IS NOT NULL AND gs.lon IS NOT NULL
-        AND (gs.fix_quality IS NULL OR gs.fix_quality >= 1)
-        AND (gs.rmc_status IS NULL OR gs.rmc_status = 'A')
-      ORDER BY abs(gs.t_rel_s - f.offset_s) NULLS LAST
-      LIMIT 1
-    ) g ON TRUE
-    WHERE f.drive_session_id = $1::uuid
-    ORDER BY f.ts_utc
+    SELECT ts_utc, local_time, offset_s, source_clip, clip_offset_s, file_name, media_rel_path,
+           lat, lon, speed_mph, course_deg
+    FROM dashcam.storyboard_frame
+    WHERE drive_session_id = $1::uuid
+    ORDER BY ts_utc
     LIMIT $2;
     """
     assert pool is not None
@@ -185,6 +164,7 @@ async def get_storyboard(session_id: str, limit: int = Query(5000, ge=1, le=2000
         d["url"] = f"/media/{rel}" if rel else None
         out.append(d)
     return out
+
 
 @app.get("/sessions/{session_id}/events")
 async def get_events(
