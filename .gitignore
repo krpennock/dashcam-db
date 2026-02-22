@@ -30,3 +30,7 @@ artifacts/
 # Docker / Postgres local volumes (common patterns)
 **/pgdata/
 **/postgres-data/
+
+# Local editor backups
+ui/*.bak.*
+ui/*.save
