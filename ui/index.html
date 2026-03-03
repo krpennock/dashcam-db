@@ -48,6 +48,20 @@
 
     .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .toggle { display:flex; gap:8px; align-items:center; color:var(--muted); font-size:12px; }
+
+    /* Session browser table */
+    .session-filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:8px; }
+    .session-filters select, .session-filters input[type="date"] { font-size:12px; padding:5px 8px; }
+    .session-filters label { font-size:11px; color:var(--muted); }
+    .session-table-wrap { max-height:260px; overflow-y:auto; border:1px solid var(--border); border-radius:8px; }
+    .session-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .session-table th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; text-align:left; cursor:pointer; user-select:none; border-bottom:1px solid var(--border); }
+    .session-table th:hover { color:var(--text); }
+    .session-table td { padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    .session-table tr { cursor:pointer; }
+    .session-table tbody tr:hover { background:rgba(255,255,255,0.04); }
+    .session-table tbody tr.active { background:rgba(100,180,255,0.12); }
+    .session-status { font-size:11px; color:var(--muted); margin-top:6px; }
     .toggle input { transform: translateY(1px); }
 
     .events { max-height: 26vh; overflow:auto; margin-top:10px; }
@@ -134,10 +148,27 @@
   <div class="grid">
     <div class="left">
       <div class="card">
-        <div class="row">
-          <select id="sessionSelect" style="flex:1; min-width: 280px;"></select>
-          <button id="loadBtn" disabled>Load</button>
+        <div class="session-filters">
+          <label>Vehicle
+            <select id="vehicleFilter"><option value="">All</option></select>
+          </label>
+          <label>From <input type="date" id="dateFrom" /></label>
+          <label>To <input type="date" id="dateTo" /></label>
         </div>
+        <div class="session-table-wrap">
+          <table class="session-table">
+            <thead>
+              <tr>
+                <th data-col="vehicle_tag">Veh</th>
+                <th data-col="start_ts_utc">Date</th>
+                <th data-col="duration_s">Time</th>
+                <th data-col="distance_mi">Dist</th>
+              </tr>
+            </thead>
+            <tbody id="sessionTableBody"></tbody>
+          </table>
+        </div>
+        <div class="session-status" id="sessionStatus">Loading&hellip;</div>
         <div class="kv" id="sessionMeta" style="margin-top:10px;">
           <div><b>Session:</b> <span class="small">none loaded</span></div>
         </div>
@@ -219,8 +250,11 @@
   const API = `/api`;
   document.getElementById("apiBase").textContent = `API: ${location.origin}/api`;
 
-  const elSessionSelect = document.getElementById("sessionSelect");
-  const elLoadBtn = document.getElementById("loadBtn");
+  const elVehicleFilter = document.getElementById("vehicleFilter");
+  const elDateFrom = document.getElementById("dateFrom");
+  const elDateTo = document.getElementById("dateTo");
+  const elSessionTableBody = document.getElementById("sessionTableBody");
+  const elSessionStatus = document.getElementById("sessionStatus");
   const elSessionMeta = document.getElementById("sessionMeta");
   const elScrub = document.getElementById("scrubSlider");
   const elScrubIso = document.getElementById("scrubIso");
@@ -322,6 +356,7 @@
           type: "raster",
           tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
           tileSize: 256,
+          maxzoom: 19,
           attribution: "© OpenStreetMap contributors"
        }
      },
@@ -725,7 +760,7 @@
 
     elNearestInfo.innerHTML = `
       <div><b>GNSS:</b> <span class="small">${data.gnss ? `${data.gnss.ts_utc}  (${data.gnss.lat.toFixed(6)}, ${data.gnss.lon.toFixed(6)})  ${Math.round(data.gnss.speed_mph)} mph` : "—"}</span></div>
-      <div><b>Accel:</b> <span class="small">${data.accel ? `${data.accel.ts_utc}  a_mag=${data.accel.a_mag_raw.toFixed(2)}  ax=${data.accel.ax.toFixed(1)} ay=${data.accel.ay.toFixed(1)} az=${data.accel.az.toFixed(1)}` : "—"}</span></div>
+      <div><b>Accel:</b> <span class="small">${data.accel && data.accel.a_mag_raw != null ? `${data.accel.ts_utc}  a_mag=${data.accel.a_mag_raw.toFixed(2)}  ax=${data.accel.ax.toFixed(1)} ay=${data.accel.ay.toFixed(1)} az=${data.accel.az.toFixed(1)}` : "—"}</span></div>
       <div><b>Clip:</b> <span class="small">${data.clip ? `${data.clip.clip_name}  (${data.clip.start_ts_utc} → ${data.clip.end_ts_utc})` : "—"}</span></div>
     `;
   }
@@ -856,23 +891,82 @@
     }
   }
 
-  async function loadSessions() {
-    const sessions = await apiGet("/sessions");
+  // --- Formatting helpers ---
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    const mon = d.toLocaleString("en-US", { month: "short", timeZone: "America/Chicago" });
+    const day = d.toLocaleString("en-US", { day: "numeric", timeZone: "America/Chicago" });
+    let hr = d.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+    hr = hr.replace(/ AM/, "a").replace(/ PM/, "p");
+    return `${mon} ${day} ${hr}`;
+  }
+  function fmtDuration(s) {
+    if (s == null) return "—";
+    const m = Math.round(s / 60);
+    if (m < 60) return `${m}m`;
+    return `${Math.floor(m / 60)}h ${m % 60}m`;
+  }
+  function fmtDist(mi) {
+    if (mi == null) return "—";
+    return `${mi.toFixed(1)} mi`;
+  }
 
-    const usable = sessions.filter(s => s.start_ts_utc);
-    const list = usable.length ? usable : sessions;
+  // --- Session browser state ---
+  let allSessions = [];
+  let sortCol = "start_ts_utc";
+  let sortAsc = false; // newest first
 
-    elSessionSelect.innerHTML = list.map(s =>
-      `<option value="${s.drive_session_id}">${(s.vehicle_tag||"—")}  ${s.start_ts_utc || "(no start)"}  ${s.drive_session_id.slice(0,8)}</option>`
+  function renderSessionTable(list) {
+    elSessionTableBody.innerHTML = list.map(s =>
+      `<tr data-sid="${s.drive_session_id}">
+        <td>${s.vehicle_tag || "—"}</td>
+        <td>${fmtDate(s.start_ts_utc)}</td>
+        <td>${fmtDuration(s.duration_s)}</td>
+        <td>${fmtDist(s.distance_mi)}</td>
+      </tr>`
     ).join("");
+    elSessionStatus.textContent = `${list.length} session${list.length !== 1 ? "s" : ""}`;
+  }
 
-    elLoadBtn.disabled = list.length === 0;
-    if (list.length > 0) elSessionSelect.value = list[0].drive_session_id;
+  function sortSessions(sessions) {
+    return [...sessions].sort((a, b) => {
+      let va = a[sortCol], vb = b[sortCol];
+      if (va == null && vb == null) return 0;
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      if (typeof va === "string") { va = va.toLowerCase(); vb = (vb || "").toLowerCase(); }
+      const cmp = va < vb ? -1 : va > vb ? 1 : 0;
+      return sortAsc ? cmp : -cmp;
+    });
+  }
+
+  async function fetchSessions() {
+    const params = new URLSearchParams();
+    const veh = elVehicleFilter.value;
+    if (veh) params.set("vehicle", veh);
+    const after = elDateFrom.value;
+    if (after) params.set("after", after + "T00:00:00Z");
+    const before = elDateTo.value;
+    if (before) params.set("before", before + "T23:59:59Z");
+    const qs = params.toString();
+    allSessions = await apiGet("/sessions" + (qs ? "?" + qs : ""));
+    renderSessionTable(sortSessions(allSessions));
+  }
+
+  async function loadSessions() {
+    // Populate vehicle filter
+    try {
+      const vehicles = await apiGet("/vehicles");
+      elVehicleFilter.innerHTML = `<option value="">All</option>` +
+        vehicles.map(v => `<option value="${v}">${v}</option>`).join("");
+    } catch (e) { /* keep default "All" */ }
+
+    await fetchSessions();
   }
 
   async function loadSession(sessionId) {
     if (!sessionId) throw new Error("No session selected");
-    elLoadBtn.disabled = true;
     clearStoryboard();
 
     try {
@@ -928,8 +1022,8 @@
 
       enableScrub(s.start_ts_utc, s.end_ts_utc);
       await fetchNearest(Date.parse(s.start_ts_utc));
-    } finally {
-      elLoadBtn.disabled = false;
+    } catch (err) {
+      alert(err.message);
     }
   }
 
@@ -958,7 +1052,30 @@
     }
   });
 
-  elLoadBtn.addEventListener("click", () => loadSession(elSessionSelect.value).catch(err => alert(err.message)));
+  // Session table: click row to load
+  elSessionTableBody.addEventListener("click", (e) => {
+    const tr = e.target.closest("tr[data-sid]");
+    if (!tr) return;
+    // Highlight active row
+    elSessionTableBody.querySelectorAll("tr.active").forEach(r => r.classList.remove("active"));
+    tr.classList.add("active");
+    loadSession(tr.dataset.sid);
+  });
+
+  // Column header sorting
+  document.querySelectorAll(".session-table th[data-col]").forEach(th => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.col;
+      if (sortCol === col) { sortAsc = !sortAsc; } else { sortCol = col; sortAsc = true; }
+      renderSessionTable(sortSessions(allSessions));
+    });
+  });
+
+  // Filter change handlers
+  elVehicleFilter.addEventListener("change", () => fetchSessions());
+  elDateFrom.addEventListener("change", () => fetchSessions());
+  elDateTo.addEventListener("change", () => fetchSessions());
+
   elScrub.addEventListener("input", onScrubInput);
 
   loadSessions().catch(err => alert(err.message));

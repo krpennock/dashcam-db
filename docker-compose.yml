@@ -60,7 +60,7 @@ services:
       DB_USER: ${POSTGRES_USER}
       DB_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - ./import:/import:ro
+      - ${IMPORT_ROOT:-./import}:/import:ro
       - ./media:/media:rw
     depends_on:
       db:

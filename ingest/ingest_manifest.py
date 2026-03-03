@@ -235,6 +235,10 @@ def main() -> None:
 
             # --- Accel insert ---
             # ts_utc computed from drive_session.start_ts_utc + t_rel_s (canonical)
+            # g-force computed from raw counts (BlackVue: 128 counts/g)
+            accel_meta = _get_path(telem, "accel", "counts_per_g")
+            counts_per_g = float(accel_meta) if accel_meta else 128.0
+
             cur.execute(
                 """
                 INSERT INTO dashcam.accel_sample (
@@ -243,6 +247,7 @@ def main() -> None:
                   t_rel_s,
                   ts_utc,
                   ax_raw, ay_raw, az_raw,
+                  ax_g, ay_g, az_g, a_mag_g,
                   clip_name,
                   idx,
                   t_clip_ms
@@ -255,12 +260,15 @@ def main() -> None:
                      FROM dashcam.drive_session ds
                     WHERE ds.drive_session_id = %s::uuid) + (s.t_rel_s * interval '1 second'),
                   s.ax, s.ay, s.az,
+                  s.ax / %s, s.ay / %s, s.az / %s,
+                  |/ ((s.ax / %s)^2 + (s.ay / %s)^2 + (s.az / %s)^2),
                   s.clip,
                   s.idx,
                   s.t_clip_ms
                 FROM dashcam.accel_csv_stage s;
                 """,
-                (sid, sid),
+                (sid, sid, counts_per_g, counts_per_g, counts_per_g,
+                 counts_per_g, counts_per_g, counts_per_g),
             )
 
             # --- Storyboard thumbs ---

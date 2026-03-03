@@ -92,17 +92,43 @@ async def health():
     return {"ok": True, "db": v}
 
 
-@app.get("/sessions")
-async def list_sessions(limit: int = Query(50, ge=1, le=500)):
+@app.get("/vehicles")
+async def list_vehicles():
     q = """
-    SELECT drive_session_id::text, vehicle_tag, start_ts_utc, end_ts_utc, notes
+    SELECT DISTINCT vehicle_tag
     FROM dashcam.drive_session
-    ORDER BY start_ts_utc DESC NULLS LAST
-    LIMIT $1;
+    WHERE vehicle_tag IS NOT NULL
+    ORDER BY vehicle_tag;
     """
     assert pool is not None
     async with pool.acquire() as con:
-        rows = await con.fetch(q, limit)
+        rows = await con.fetch(q)
+    return [r["vehicle_tag"] for r in rows]
+
+
+@app.get("/sessions")
+async def list_sessions(
+    limit: int = Query(500, ge=1, le=5000),
+    vehicle: Optional[str] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+):
+    after_ts = _parse_ts(after)
+    before_ts = _parse_ts(before)
+    q = """
+    SELECT d.drive_session_id::text, d.vehicle_tag, d.start_ts_utc, d.end_ts_utc,
+           s.duration_s, s.distance_mi, s.max_speed_mph, s.avg_speed_mph
+    FROM dashcam.drive_session d
+    LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
+    WHERE ($1::text IS NULL OR d.vehicle_tag = $1)
+      AND ($2::timestamptz IS NULL OR d.start_ts_utc >= $2)
+      AND ($3::timestamptz IS NULL OR d.start_ts_utc <= $3)
+    ORDER BY d.start_ts_utc DESC NULLS LAST
+    LIMIT $4;
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, vehicle, after_ts, before_ts, limit)
     return [dict(r) for r in rows]
 
 
