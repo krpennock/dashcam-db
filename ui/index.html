@@ -216,8 +216,8 @@
 
 <script>
 (() => {
-  const API = `${location.protocol}//${location.hostname}:8000`;
-  document.getElementById("apiBase").textContent = `API: ${API}`;
+  const API = `/api`;
+  document.getElementById("apiBase").textContent = `API: ${location.origin}/api`;
 
   const elSessionSelect = document.getElementById("sessionSelect");
   const elLoadBtn = document.getElementById("loadBtn");
