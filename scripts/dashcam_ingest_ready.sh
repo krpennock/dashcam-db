@@ -62,7 +62,7 @@ count_skip=0
 
 for d in "$READY_DIR"/*; do
   [[ -d "$d" ]] || continue
-  ((count_total++))
+  ((++count_total))
 
   name="$(basename "$d")"
   host_manifest="$d/manifest.json"
@@ -70,7 +70,7 @@ for d in "$READY_DIR"/*; do
 
   if [[ ! -f "$host_manifest" ]]; then
     echo "SKIP (no manifest.json): $d"
-    ((count_skip++))
+    ((++count_skip))
     continue
   fi
 
@@ -83,10 +83,10 @@ for d in "$READY_DIR"/*; do
 
   if $SUDO $COMPOSE --profile tools run --rm ingest "$container_manifest"; then
     mv "$d" "$DONE_DIR/"
-    ((count_ok++))
+    ((++count_ok))
   else
     mv "$d" "$FAILED_DIR/"
-    ((count_fail++))
+    ((++count_fail))
   fi
 done
 
