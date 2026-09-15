@@ -40,8 +40,10 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -75,6 +77,467 @@ DEFAULT_DERIVED_PARAMS: Dict[str, object] = {
     "stop_min_s": 15,
     "bump_cooldown_s": 3,
 }
+
+
+# --- dashcam-db pipeline support -------------------------------------------
+#
+# Deterministic drive tags, atomic build folders, a robust session-time anchor
+# and clip-accurate still timestamps, so the automated pipeline can re-run the
+# script safely and land correct times in the database.
+
+SCRIPT_VERSION = "61.0"
+
+# Both cameras run on a fixed offset from UTC with no daylight saving, so clip
+# filenames and the bracketed RTC milliseconds in the NMEA sidecars are camera
+# local time. This is the fallback clock whenever GNSS is unusable.
+DEFAULT_CAMERA_UTC_OFFSET = "-06:00"
+
+# Rows with a confirmed GNSS fix ("A") a drive needs before GNSS is trusted for
+# the session anchor.
+GNSS_MIN_VALID_ROWS = 30
+
+# GNSS and the camera clock normally agree within seconds. Past this the GNSS
+# anchor still wins, but the manifest records the disagreement for review.
+GNSS_FILENAME_TOLERANCE_S = 900.0
+
+# Written last inside a build folder: its presence means the folder is complete.
+COMPLETE_MARKER_NAME = "_complete.json"
+BUILD_DIR_SUFFIX = ".build"
+
+CLIP_NAME_RE = re.compile(
+    r"^(?P<date>\d{8})_(?P<time>\d{6})_(?P<type>[A-Z]+)(?P<view>[FR])$", re.IGNORECASE
+)
+
+# Arguments that change what ends up in a drive folder. A drive is rebuilt when
+# any of these differ from the marker left by the previous run; paths, job counts
+# and other run-local switches are deliberately excluded.
+ARGS_SIGNATURE_KEYS: Tuple[str, ...] = (
+    "vehicle", "output_layout", "manifest_filename", "clip_seconds", "gap_seconds",
+    "min_drive_seconds", "min_drive_clips", "front_only", "recurse",
+    "run_ffmpeg", "for_resolve", "stitched_dest", "resolve_audio_bitrate_kbps",
+    "run_blackclue", "blackclue_mode", "blackclue_view", "telemetry_sidecar_action",
+    "no_stitch_nmea", "emit_csv", "emit_gpx", "emit_accel", "emit_manifest",
+    "emit_timelapse", "timelapse_every_seconds", "timelapse_playback_fps",
+    "timelapse_width", "timelapse_view", "timelapse_codec", "timelapse_crf",
+    "emit_stills", "stills_every_seconds", "stills_width", "stills_format",
+    "stills_quality", "stills_max", "stills_name", "stills_index", "stills_geojson",
+    "stills_view", "emit_events", "emit_event_stills", "timezone",
+    "camera_utc_offset", "source_model", "source_serial", "source_firmware",
+    "manifest_sha256", "compose_preview", "run_map_render",
+)
+
+
+@dataclass(frozen=True)
+class ClipSegment:
+    """One clip's place on the stitched timeline, plus its real start time."""
+
+    path: Path
+    concat_start_s: float
+    duration_s: float
+    start_utc: _dt.datetime
+
+
+def parse_utc_offset(text: str) -> _dt.timezone:
+    """Parse "-06:00" / "+0530" / "Z" into a fixed timezone."""
+    s = (text or "").strip()
+    if not s or s.upper() == "Z":
+        return _dt.timezone.utc
+    m = re.match(r"^([+-])(\d{2}):?(\d{2})$", s)
+    if not m:
+        raise ValueError(f"Invalid UTC offset {text!r}; expected +HH:MM or -HH:MM")
+    delta = _dt.timedelta(hours=int(m.group(2)), minutes=int(m.group(3)))
+    return _dt.timezone(-delta if m.group(1) == "-" else delta)
+
+
+def format_utc_offset(tz: _dt.tzinfo) -> str:
+    """Render a fixed timezone back as "-06:00"."""
+    off = tz.utcoffset(None) or _dt.timedelta(0)
+    total = int(off.total_seconds())
+    sign = "-" if total < 0 else "+"
+    total = abs(total)
+    return f"{sign}{total // 3600:02d}:{(total % 3600) // 60:02d}"
+
+
+def _iso_z_seconds(dt: Optional[_dt.datetime]) -> Optional[str]:
+    """ISO-8601 UTC with a Z suffix and whole seconds."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def clip_type_from_name(name: str) -> Optional[str]:
+    """BlackVue recording type letter for a clip: N, E, P, I or M."""
+    m = CLIP_NAME_RE.match(Path(name).stem)
+    return m.group("type").upper() if m else None
+
+
+def clip_set_sha1(clip_stems: Iterable[str]) -> str:
+    """Stable hash of the clips that make up a drive (order independent)."""
+    h = hashlib.sha1()
+    for name in sorted({str(n) for n in clip_stems}):
+        h.update(name.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def args_signature(args: object) -> Tuple[str, Dict[str, object]]:
+    """Hash of the processing options that affect a drive folder's contents."""
+    payload: Dict[str, object] = {k: getattr(args, k, None) for k in ARGS_SIGNATURE_KEYS}
+    payload = {k: (str(v) if isinstance(v, Path) else v) for k, v in payload.items()}
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest(), payload
+
+
+def _retry_io(fn, *, what: str, attempts: int = 6, base_delay: float = 0.5):
+    """Run a filesystem operation, retrying transient Windows lock errors.
+
+    Explorer, Defender and the search indexer routinely hold a handle for a moment
+    after a folder is written, which makes rename/delete fail with EACCES.
+    """
+    last: Optional[BaseException] = None
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except OSError as exc:
+            last = exc
+            if attempt == attempts - 1:
+                break
+            delay = base_delay * (2 ** attempt)
+            eprint(f"  [WARN] {what}: {exc}; retrying in {delay:.1f}s")
+            time.sleep(delay)
+    raise RuntimeError(f"{what} failed after {attempts} attempts: {last}")
+
+
+def _rmtree_onerror(func, path, _exc) -> None:
+    """Clear the read-only bit and retry the failed removal step."""
+    try:
+        os.chmod(path, 0o700)
+    except Exception:
+        pass
+    func(path)
+
+
+def rmtree_retry(path: Path) -> None:
+    """Delete a folder tree, tolerating brief Windows locks."""
+    if not path.exists():
+        return
+
+    def _rm() -> None:
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=_rmtree_onerror)
+        else:
+            shutil.rmtree(path, onerror=_rmtree_onerror)
+
+    _retry_io(_rm, what=f"remove {path}")
+
+
+def rename_retry(src: Path, dst: Path) -> None:
+    """Rename a file or folder, tolerating brief Windows locks."""
+    if dst.exists():
+        raise RuntimeError(f"rename target already exists: {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _retry_io(lambda: os.rename(src, dst), what=f"rename {src} -> {dst}")
+
+
+def _device_utc_from_row(row: Dict[str, str]) -> Optional[_dt.datetime]:
+    """UTC time from a GNSS CSV row's own date/time fields.
+
+    Uses date_ddmmyy + time_hhmmss rather than utc_time, because utc_time is
+    backfilled for rows that never carried a GNSS time of their own.
+    """
+    d = (row.get("date_ddmmyy") or "").strip()
+    t = (row.get("time_hhmmss") or "").strip()
+    if len(d) != 6 or not d.isdigit() or len(t) < 6 or not t[:6].isdigit():
+        return None
+    try:
+        return _dt.datetime(
+            2000 + int(d[4:6]), int(d[2:4]), int(d[0:2]),
+            int(t[0:2]), int(t[2:4]), int(t[4:6]),
+            tzinfo=_dt.timezone.utc,
+        )
+    except ValueError:
+        return None
+
+
+def gnss_anchor_from_csv(gnss_csv: Path) -> Dict[str, object]:
+    """Robust UTC timestamp for t_rel_s == 0, the start of the drive's telemetry.
+
+    Every fixed row votes: anchor_i = (receiver's own UTC) - t_rel_s. The median
+    ignores the stale rows the camera emits just after waking from parking mode,
+    which still report the previous fix's time with status "A". Those rows are
+    what made the old "earliest point in the largest cluster" anchor start some
+    drives up to 80 minutes early.
+    """
+    empty = {"anchor_epoch": None, "valid_rows": 0, "rows": 0, "spread_s": None}
+    anchors: List[float] = []
+    rows = 0
+    try:
+        with open(gnss_csv, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows += 1
+                if (row.get("rmc_status") or "").strip().upper() != "A":
+                    continue
+                dev = _device_utc_from_row(row)
+                if dev is None:
+                    continue
+                try:
+                    t_rel = float((row.get("t_rel_s") or "").strip())
+                except ValueError:
+                    continue
+                anchors.append(dev.timestamp() - t_rel)
+    except OSError:
+        return dict(empty)
+
+    if not anchors:
+        out = dict(empty)
+        out["rows"] = rows
+        return out
+
+    anchors.sort()
+    lo = anchors[int(0.05 * (len(anchors) - 1))]
+    hi = anchors[int(0.95 * (len(anchors) - 1))]
+    return {
+        "anchor_epoch": statistics.median(anchors),
+        "valid_rows": len(anchors),
+        "rows": rows,
+        "spread_s": round(hi - lo, 3),
+    }
+
+
+def probe_durations(
+    ffprobe_exe: Optional[str],
+    paths: Sequence[Path],
+    cache: Dict[Path, Optional[float]],
+) -> Dict[Path, Optional[float]]:
+    """Measure each clip once with ffprobe; None when it cannot be measured."""
+    if not ffprobe_exe:
+        return {}
+    for p in paths:
+        if p in cache:
+            continue
+        try:
+            done = subprocess.run(
+                [ffprobe_exe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(p)],
+                capture_output=True, text=True, timeout=120,
+            )
+            text = (done.stdout or "").strip()
+            cache[p] = float(text) if (done.returncode == 0 and text) else None
+        except Exception:
+            cache[p] = None
+    return {p: cache.get(p) for p in paths}
+
+
+def compute_session_time(
+    *,
+    gnss_csv: Optional[Path],
+    accel_csv: Optional[Path],
+    clip_paths: Sequence[Path],
+    camera_tz: _dt.timezone,
+    clip_seconds: float,
+    durations: Optional[Dict[Path, Optional[float]]] = None,
+) -> Dict[str, object]:
+    """Decide when a drive started, and how much to trust that.
+
+    GNSS wins when the drive has enough confirmed fixes, because the camera clock
+    drifts and can be set outright wrong (one camera ran five hours off in
+    January 2026). Otherwise the clip filenames, read at the fixed camera offset,
+    are the best clock available and the drive is flagged "filename_low" so the
+    database and the web UI can show that the time is approximate.
+    """
+    file_start_utc: Optional[_dt.datetime] = None
+    for p in clip_paths:
+        parsed = parse_timestamp_from_name(p.name)
+        if parsed:
+            file_start_utc = parsed[1].replace(tzinfo=camera_tz).astimezone(_dt.timezone.utc)
+            break
+
+    info = (
+        gnss_anchor_from_csv(gnss_csv)
+        if (gnss_csv is not None and gnss_csv.exists())
+        else {"anchor_epoch": None, "valid_rows": 0, "rows": 0, "spread_s": None}
+    )
+    valid_rows = int(info.get("valid_rows") or 0)
+    anchor_epoch = info.get("anchor_epoch")
+
+    start_dt: Optional[_dt.datetime] = None
+    confidence = "unknown"
+    clock_offset_s = 0.0
+    filename_delta_s: Optional[float] = None
+
+    if anchor_epoch is not None and valid_rows >= GNSS_MIN_VALID_ROWS:
+        start_dt = _dt.datetime.fromtimestamp(float(anchor_epoch), tz=_dt.timezone.utc)
+        confidence = "gnss_median"
+        if file_start_utc is not None:
+            filename_delta_s = (start_dt - file_start_utc).total_seconds()
+            clock_offset_s = filename_delta_s
+            if abs(filename_delta_s) > GNSS_FILENAME_TOLERANCE_S:
+                # GNSS still wins, but something is wrong with the camera clock.
+                confidence = "gnss_median_clock_mismatch"
+    elif file_start_utc is not None:
+        start_dt = file_start_utc
+        confidence = "filename_low"
+
+    # Duration: the telemetry timelines first, because they span any parking gap
+    # that the stitched video does not contain; then the measured clips.
+    duration_candidates: List[float] = []
+    for csv_path in (gnss_csv, accel_csv):
+        if csv_path is not None and csv_path.exists():
+            mx = _max_t_rel_s_from_csv(csv_path)
+            if mx is not None:
+                duration_candidates.append(float(mx))
+    if clip_paths:
+        first_parsed = parse_timestamp_from_name(clip_paths[0].name)
+        last_parsed = parse_timestamp_from_name(clip_paths[-1].name)
+        if first_parsed and last_parsed:
+            last_dur = (durations or {}).get(clip_paths[-1])
+            duration_candidates.append(
+                (last_parsed[1] - first_parsed[1]).total_seconds()
+                + float(last_dur if last_dur else clip_seconds)
+            )
+    duration_s = max(duration_candidates) if duration_candidates else None
+
+    end_dt = (
+        start_dt + _dt.timedelta(seconds=float(duration_s))
+        if (start_dt is not None and duration_s is not None)
+        else None
+    )
+
+    return {
+        "start_ts_utc": _iso_z_seconds(start_dt),
+        "end_ts_utc": _iso_z_seconds(end_dt),
+        "time_confidence": confidence,
+        "anchor_method": "gnss_median" if confidence.startswith("gnss") else (
+            "filename" if confidence == "filename_low" else "none"
+        ),
+        "gnss_valid_rows": valid_rows,
+        "gnss_rows": int(info.get("rows") or 0),
+        "gnss_min_valid_rows": GNSS_MIN_VALID_ROWS,
+        "gnss_anchor_spread_s": info.get("spread_s"),
+        "filename_start_ts_utc": _iso_z_seconds(file_start_utc),
+        "filename_delta_s": round(filename_delta_s, 3) if filename_delta_s is not None else None,
+        "clock_offset_s": round(clock_offset_s, 3),
+        "camera_utc_offset": format_utc_offset(camera_tz),
+        "duration_s": round(float(duration_s), 3) if duration_s is not None else None,
+    }
+
+
+def build_clip_segments(
+    paths: Sequence[Path],
+    *,
+    camera_tz: _dt.timezone,
+    clock_offset_s: float,
+    clip_seconds: float,
+    durations: Optional[Dict[Path, Optional[float]]] = None,
+) -> List[ClipSegment]:
+    """Lay clips out on the stitched timeline with their real start times.
+
+    Clip length varies: the camera writes ~61 s clips, and a normal clip is cut
+    short (as little as 9 s) when an event or parking clip takes over. Measuring
+    each clip stops still timestamps from drifting, and starting each clip from
+    its own filename keeps them right across a parking gap that is missing from
+    the stitched video.
+    """
+    segs: List[ClipSegment] = []
+    t_concat = 0.0
+    for p in paths:
+        parsed = parse_timestamp_from_name(p.name)
+        if not parsed:
+            continue
+        _, naive = parsed
+        start_utc = naive.replace(tzinfo=camera_tz).astimezone(_dt.timezone.utc) + _dt.timedelta(
+            seconds=float(clock_offset_s)
+        )
+        dur = (durations or {}).get(p)
+        segs.append(
+            ClipSegment(
+                path=p,
+                concat_start_s=t_concat,
+                duration_s=float(dur) if dur else float(clip_seconds),
+                start_utc=start_utc,
+            )
+        )
+        t_concat += segs[-1].duration_s
+    return segs
+
+
+def segment_for_concat_offset(
+    segs: Sequence[ClipSegment], offset_s: float
+) -> Tuple[Optional[ClipSegment], float]:
+    """Map an offset in the stitched video back to (clip, offset within clip)."""
+    if not segs:
+        return (None, float(offset_s))
+    idx = bisect.bisect_right([s.concat_start_s for s in segs], float(offset_s)) - 1
+    if idx < 0:
+        idx = 0
+    seg = segs[idx]
+    return (seg, max(0.0, float(offset_s) - seg.concat_start_s))
+
+
+def write_complete_marker(folder: Path, payload: Dict[str, object]) -> None:
+    (folder / COMPLETE_MARKER_NAME).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def read_complete_marker(folder: Path) -> Optional[Dict[str, object]]:
+    p = folder / COMPLETE_MARKER_NAME
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def manifest_clip_stems(manifest_path: Path) -> Optional[set]:
+    """Clip names listed by an existing manifest, or None if unreadable."""
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    clips = data.get("clips")
+    if not isinstance(clips, list):
+        return None
+    names = {str(c.get("clip_name")) for c in clips if isinstance(c, dict) and c.get("clip_name")}
+    return names or None
+
+
+def drive_build_decision(
+    final_dir: Path,
+    *,
+    manifest_name: str,
+    clip_stems: Sequence[str],
+    signature: str,
+) -> Tuple[str, str]:
+    """Decide whether an existing drive folder can be kept as it is.
+
+    Returns (action, reason); action is "build", "skip" or "adopt". "adopt" means
+    the folder predates the completion marker but holds exactly the same clips,
+    so it is kept and the marker is written for it now.
+    """
+    if not final_dir.is_dir():
+        return ("build", "no existing folder")
+
+    want_hash = clip_set_sha1(clip_stems)
+    marker = read_complete_marker(final_dir)
+    if marker:
+        if marker.get("clip_set_sha1") != want_hash:
+            return ("build", "clip set changed")
+        if marker.get("args_signature") != signature:
+            return ("build", "processing options changed")
+        return ("skip", "complete and unchanged")
+
+    manifest_path = final_dir / manifest_name
+    if not manifest_path.exists():
+        return ("build", "folder has no manifest")
+    names = manifest_clip_stems(manifest_path)
+    if names is None:
+        return ("build", "manifest unreadable")
+    if names != set(clip_stems):
+        return ("build", "clip set differs from manifest")
+    return ("adopt", "existing manifest matches clip set")
 
 
 @dataclass(frozen=True)
@@ -257,6 +720,66 @@ def scan_pairs(source: Path, recurse: bool, exclude_dirs: Sequence[str], exclude
 
     pairs.sort(key=lambda p: p.ts_dt)
     return pairs
+
+
+def pairs_from_clip_list(list_file: Path) -> List[ClipPair]:
+    """Build clip pairs from an explicit list of clip paths, one per line.
+
+    The pipeline groups clips into drives itself (it knows which clips are new and
+    which drive they extend), so it hands the script exactly the files for one
+    drive instead of pointing it at a folder to scan.
+    """
+    by_ts: Dict[str, Dict[str, Path]] = {}
+    by_dt: Dict[str, _dt.datetime] = {}
+    missing: List[str] = []
+
+    for raw in list_file.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        p = Path(line)
+        if not p.is_file():
+            missing.append(line)
+            continue
+        ts = parse_timestamp_from_name(p.name)
+        view = is_front_or_rear(p)
+        if not ts or not view:
+            eprint(f"[WARN] ignoring unrecognised clip name: {p.name}")
+            continue
+        by_ts.setdefault(ts[0], {})[view] = p
+        by_dt[ts[0]] = ts[1]
+
+    if missing:
+        sample = "\n".join(f"  - {m}" for m in missing[:10])
+        raise SystemExit(f"Clips listed in --clips-from do not exist:\n{sample}")
+
+    pairs = [
+        ClipPair(ts_key=k, ts_dt=by_dt[k], front=v.get("F"), rear=v.get("R"))
+        for k, v in by_ts.items()
+    ]
+    pairs.sort(key=lambda p: p.ts_dt)
+    return pairs
+
+
+def swap_build_into_place(build_dir: Path, final_dir: Path, *, retire_root: Path) -> None:
+    """Move a finished build folder into place, retiring any previous version.
+
+    Both renames stay on one volume, so each is atomic: a reader (or an interrupted
+    run) never sees a half-written drive folder in the import tree.
+    """
+    retired: Optional[Path] = None
+    if final_dir.exists():
+        stamp = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+        retired = retire_root / f"{final_dir.name}.old-{stamp}"
+        rename_retry(final_dir, retired)
+    try:
+        rename_retry(build_dir, final_dir)
+    except Exception:
+        if retired is not None and not final_dir.exists():
+            rename_retry(retired, final_dir)  # put the previous version back
+        raise
+    if retired is not None:
+        rmtree_retry(retired)
 
 
 # --- Manifest (per drive session) ---
@@ -717,6 +1240,13 @@ def write_manifest_json(
     clip_seconds: Optional[float] = None,
     stills_view: Optional[str] = None,
     stills_every_seconds: Optional[float] = None,
+    # Pipeline extensions (all additive; schema_version stays 2)
+    session_time: Optional[Dict[str, object]] = None,
+    drive_session_id: Optional[str] = None,
+    clip_set_hash: Optional[str] = None,
+    clips_excluded: Optional[List[Dict[str, object]]] = None,
+    clock_utc_offset: Optional[str] = None,
+    pipeline_info: Optional[Dict[str, object]] = None,
 ) -> None:
     """Write schema v2 manifest.json.
 
@@ -724,7 +1254,13 @@ def write_manifest_json(
     """
 
     manifest_dir = manifest_path.parent
-    drive_session_id = _stable_drive_session_id(vehicle_tag=vehicle_tag, drive_tag=drive_tag)
+    expected_sid = _stable_drive_session_id(vehicle_tag=vehicle_tag, drive_tag=drive_tag)
+    if drive_session_id and str(drive_session_id) != expected_sid:
+        raise ValueError(
+            f"drive_session_id {drive_session_id} does not match the id derived from "
+            f"vehicle {vehicle_tag!r} and drive tag {drive_tag!r} ({expected_sid})"
+        )
+    drive_session_id = expected_sid
     created_utc = _utc_now_iso_z()
 
     def _rel(p: Optional[Path]) -> Optional[str]:
@@ -950,9 +1486,11 @@ def write_manifest_json(
             session_end = max(ends).astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             time_conf = "clip_nmea_bounds"
 
-    # 4) Final fallback: parse local timestamps from clip filenames + timezone + clip_seconds
+    # 4) Final fallback: clip filenames read at the camera's fixed UTC offset.
+    #    Deliberately not the IANA timezone: the camera has no daylight saving,
+    #    so a zone like America/Chicago is an hour out for half the year.
     if not (session_start and session_end) and clip_seconds is not None:
-        tz = _try_zoneinfo(timezone)
+        tz = parse_utc_offset(clock_utc_offset or DEFAULT_CAMERA_UTC_OFFSET)
         if tz is not None:
             clip_keys: List[_dt.datetime] = []
             for c in clip_entries:
@@ -967,18 +1505,40 @@ def write_manifest_json(
                 end_local = max(clip_keys) + _dt.timedelta(seconds=float(clip_seconds))
                 session_start = start_local.astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
                 session_end = end_local.astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                time_conf = "filename_local_bounds"
+                time_conf = "filename_low"
 
-    # --- Clips (keep previous shape) ---
+    # 5) The pipeline computes the anchor itself (median of the fixed GNSS rows,
+    #    falling back to the filename clock) and passes it in. When it does, the
+    #    blocks above only contribute their diagnostics.
+    if session_time:
+        if session_time.get("start_ts_utc"):
+            session_start = str(session_time["start_ts_utc"])
+        if session_time.get("end_ts_utc"):
+            session_end = str(session_time["end_ts_utc"])
+        if session_time.get("time_confidence"):
+            time_conf = str(session_time["time_confidence"])
+        session_time_extra.update(
+            {
+                k: v
+                for k, v in session_time.items()
+                if k not in ("start_ts_utc", "end_ts_utc", "time_confidence")
+            }
+        )
+
+    # --- Clips (keep previous shape; type/duration are additive) ---
     clips_v1: List[Dict[str, object]] = []
     for c in clip_entries:
+        clip_name = str(c.get("clip_name") or "")
         entry: Dict[str, object] = {
             "channel": c.get("channel"),
             "clip_name": c.get("clip_name"),
             "role": c.get("role") or "normal",
+            "type": c.get("type") or clip_type_from_name(clip_name),
             "start_ts_utc": c.get("start_ts_utc"),
             "end_ts_utc": c.get("end_ts_utc"),
         }
+        if c.get("duration_s") is not None:
+            entry["duration_s"] = c.get("duration_s")
         entry["video"] = {"path": c.get("video_path")}
         clips_v1.append(entry)
 
@@ -1006,6 +1566,7 @@ def write_manifest_json(
     manifest = {
         "schema_version": 2,
         "drive_session_id": str(drive_session_id),
+        "drive_tag": drive_tag,
         "vehicle_tag": vehicle_tag,
         "notes": notes,
         "created_utc": created_utc,
@@ -1014,6 +1575,7 @@ def write_manifest_json(
             "model": source_model,
             "serial": source_serial,
             "timezone": timezone,
+            "clock_utc_offset": clock_utc_offset or DEFAULT_CAMERA_UTC_OFFSET,
             "firmware": source_firmware,
             "camera": {
                 "front": {"enabled": bool(camera_front_enabled)},
@@ -1021,15 +1583,20 @@ def write_manifest_json(
             },
         },
         "telemetry": telemetry,
-        
+
         "session_time": dict({
             "start_ts_utc": session_start,
             "end_ts_utc": session_end,
             "time_confidence": time_conf,
         }, **session_time_extra),
         "clips": clips_v1,
+        "clip_set_sha1": clip_set_hash or clip_set_sha1(
+            str(c.get("clip_name") or "") for c in clip_entries
+        ),
+        "clips_excluded": list(clips_excluded or []),
         "derived_params": derived_params,
         "artifacts": artifacts,
+        "pipeline": dict({"script_version": SCRIPT_VERSION}, **(pipeline_info or {})),
     }
 
     if dry_run:
@@ -1456,6 +2023,36 @@ def _gps_series_from_gnss_csv(gnss_csv: Path) -> List[Tuple[_dt.datetime, float,
     except Exception:
         return []
 
+def _gps_series_canonical(
+    gnss_csv: Path, session_start: _dt.datetime
+) -> List[Tuple[_dt.datetime, float, float, dict]]:
+    """GPS track timed the same way the database times it: start + t_rel_s.
+
+    Using each row's own utc_time would drag in the stale pre-lock rows, which
+    carry an old timestamp but a current position, and would place stills on the
+    map by a clock that disagrees with the session anchor.
+    """
+    out: List[Tuple[_dt.datetime, float, float, dict]] = []
+    try:
+        with open(gnss_csv, "r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    t_rel = float((row.get("t_rel_s") or "").strip())
+                    lat = float((row.get("lat") or "").strip() or "0")
+                    lon = float((row.get("lon") or "").strip() or "0")
+                except ValueError:
+                    continue
+                if abs(lat) < 1e-6 and abs(lon) < 1e-6:
+                    continue
+                if (row.get("rmc_status") or "").strip().upper() not in ("A", ""):
+                    continue
+                out.append((session_start + _dt.timedelta(seconds=t_rel), lat, lon, row))
+    except OSError:
+        return []
+    out.sort(key=lambda t: t[0])
+    return out
+
+
 def _gps_series_from_stitched_nmea(nmea_path: Path) -> List[Tuple[_dt.datetime, float, float, dict]]:
     """Return sorted list of (utc_dt, lat, lon, rec) for interpolation."""
     try:
@@ -1525,6 +2122,8 @@ def rename_stills_with_timestamps(
     session_start_ts_utc: Optional[str],
     write_geojson: bool,
     dry_run: bool,
+    segments: Optional[Sequence[ClipSegment]] = None,
+    camera_utc_offset: Optional[str] = None,
 ) -> None:
     """Rename %06d.jpg/png stills to timestamp-based names, write thumbs/index.csv, and optionally thumbs/index.geojson.
 
@@ -1562,8 +2161,9 @@ def rename_stills_with_timestamps(
     seq_items.sort(key=lambda t: t[0])
     ext_files = [p for _, p in seq_items]
 
-    # Determine UTC anchor for the stills timeline.
-    # Prefer explicit session_start_ts_utc (manifest anchor). Otherwise derive from GNSS CSV clustered anchor.
+    # UTC anchor for the stills timeline. The caller passes the manifest's session
+    # start (median GNSS anchor, or the filename clock when GNSS is thin); the
+    # fallback here uses the very same median method.
     utc_anchor_dt: Optional[_dt.datetime] = None
 
     def _parse_iso_z_any(s: Optional[str]) -> Optional[_dt.datetime]:
@@ -1574,61 +2174,43 @@ def rename_stills_with_timestamps(
         except Exception:
             return None
 
-    # 1) Explicit session start (video t=0 UTC)
     utc_anchor_dt = _parse_iso_z_any(session_start_ts_utc)
 
-    # 2) Derive from GNSS CSV using clustered anchor: video_start_utc = anchor_utc - anchor_t_rel_s
     if utc_anchor_dt is None and gnss_csv_path is not None and gnss_csv_path.exists():
-        try:
-            info = _analyze_gnss_csv(gnss_csv_path)
-            a_iso = info.get("gnss_anchor_ts_utc")
-            a_t = info.get("gnss_anchor_t_rel_s")
-            if a_iso and a_t is not None:
-                adt = _parse_iso_z_any(str(a_iso))
-                if adt is not None:
-                    utc_anchor_dt = adt.astimezone(_dt.timezone.utc) - _dt.timedelta(seconds=float(a_t))
-        except Exception:
-            utc_anchor_dt = None
-
-    # 3) Last resort: stitched NMEA series start (may drift; use only if nothing else)
-    if utc_anchor_dt is None and (nmea_path is not None and nmea_path.exists()):
-        try:
-            series_tmp = _gps_series_from_stitched_nmea(nmea_path)
-            if series_tmp:
-                utc_anchor_dt = series_tmp[0][0].astimezone(_dt.timezone.utc)
-        except Exception:
-            utc_anchor_dt = None
+        info = gnss_anchor_from_csv(gnss_csv_path)
+        if info.get("anchor_epoch") is not None and int(info.get("valid_rows") or 0) >= GNSS_MIN_VALID_ROWS:
+            utc_anchor_dt = _dt.datetime.fromtimestamp(
+                float(info["anchor_epoch"]), tz=_dt.timezone.utc
+            )
 
     # Determine naming granularity (milliseconds when interval < 1s)
     need_ms = float(every_seconds) < 1.0
 
-    # For local/sequence modes we use the existing filename-based segment model (may require tzdb).
-    segs = None
-    if mode != "utc":
-        try:
-            segs = _segments_for_paths(paths=paths, tz_name=tz_name, clip_seconds=clip_seconds)
-        except Exception:
-            segs = None
-        if not segs and (mode in ("local", "sequence")) and write_index:
-            # We'll still try to build an index, but local timestamps may be empty.
-            pass
+    # Map stitched-video offsets back to real clips. The caller measures each clip
+    # with ffprobe and passes the segments; without them we fall back to assuming
+    # every clip is clip_seconds long, which drifts on this camera (~61 s clips,
+    # and short clips whenever an event or parking recording interrupts).
+    segs: List[ClipSegment] = list(segments or [])
+    if not segs and utc_anchor_dt is not None:
+        segs = build_clip_segments(
+            paths,
+            camera_tz=parse_utc_offset(camera_utc_offset or DEFAULT_CAMERA_UTC_OFFSET),
+            clock_offset_s=0.0,
+            clip_seconds=clip_seconds,
+            durations=None,
+        )
 
-    def _clip_for_offset(off_s: float) -> Tuple[str, float]:
-        """Best-effort mapping from stitched-video offset to source clip name and offset within clip."""
+    def _clip_for_offset(off_s: float) -> Tuple[str, float, Optional[_dt.datetime]]:
+        """Stitched-video offset -> (clip name, offset within clip, clip start UTC)."""
+        if segs:
+            seg, within = segment_for_concat_offset(segs, off_s)
+            if seg is not None:
+                return (seg.path.name, within, seg.start_utc)
         if not paths:
-            return ("", float(off_s))
-        try:
-            idx = int(float(off_s) // float(clip_seconds))
-        except Exception:
-            idx = 0
-        if idx < 0:
-            idx = 0
-        if idx >= len(paths):
-            idx = len(paths) - 1
-        within = float(off_s) - float(idx) * float(clip_seconds)
-        if within < 0:
-            within = 0.0
-        return (paths[idx].name, within)
+            return ("", float(off_s), None)
+        idx = max(0, min(len(paths) - 1, int(float(off_s) // float(clip_seconds))))
+        within = max(0.0, float(off_s) - float(idx) * float(clip_seconds))
+        return (paths[idx].name, within, None)
 
     def _local_from_utc(utc_dt: _dt.datetime) -> Optional[_dt.datetime]:
         # Prefer manifest timezone; fall back to system local tz if tzdb is unavailable.
@@ -1651,31 +2233,27 @@ def rename_stills_with_timestamps(
         i = (int(m.group("n")) - 1) if m else 0
         off = float(i) * float(every_seconds)
 
-        src_clip_name, within = _clip_for_offset(off)
+        src_clip_name, within, clip_start_utc = _clip_for_offset(off)
 
         utc_dt: Optional[_dt.datetime] = None
         local_dt: Optional[_dt.datetime] = None
 
-        if mode == "utc":
-            if utc_anchor_dt is not None:
-                utc_dt = (utc_anchor_dt + _dt.timedelta(seconds=float(off))).astimezone(_dt.timezone.utc)
-                local_dt = _local_from_utc(utc_dt)
-        else:
-            # Local/sequence: derive local_dt from filename/segment model
-            if segs:
-                try:
-                    ldt, clip_path, within2 = _real_time_for_offset(segs=segs, offset_s=off, clip_seconds=clip_seconds)
-                    local_dt = ldt
-                    src_clip_name = clip_path.name
-                    within = within2
-                except Exception:
-                    pass
-            if mode == "local":
-                # no utc conversion required unless for index
-                pass
-            else:
-                # sequence
-                pass
+        # Time each still from its own clip's start, so a short clip or a parking
+        # gap (real time the stitched video does not contain) cannot shift it.
+        if clip_start_utc is not None:
+            utc_dt = (clip_start_utc + _dt.timedelta(seconds=float(within))).astimezone(_dt.timezone.utc)
+        elif utc_anchor_dt is not None:
+            utc_dt = (utc_anchor_dt + _dt.timedelta(seconds=float(off))).astimezone(_dt.timezone.utc)
+        if utc_dt is not None:
+            local_dt = _local_from_utc(utc_dt)
+
+        # Offset from the session start in real seconds: the database stores
+        # storyboard times as session start + offset_s.
+        real_off = (
+            (utc_dt - utc_anchor_dt).total_seconds()
+            if (utc_dt is not None and utc_anchor_dt is not None)
+            else off
+        )
 
         # Filename base
         if mode == "utc":
@@ -1725,7 +2303,7 @@ def rename_stills_with_timestamps(
                 except Exception:
                     utc_iso = ""
             local_iso = local_dt.isoformat() if local_dt is not None else ""
-        rows.append((new_path.name if mode != "sequence" else fp.name, local_iso, utc_iso, off, src_clip_name, float(within)))
+        rows.append((new_path.name if mode != "sequence" else fp.name, local_iso, utc_iso, real_off, src_clip_name, float(within)))
 
     # Apply renames (two-phase to avoid conflicts)
     if mode != "sequence":
@@ -1759,7 +2337,10 @@ def rename_stills_with_timestamps(
     if do_geo:
         series: List[Tuple[_dt.datetime, float, float, dict]] = []
         if gnss_csv_path is not None and gnss_csv_path.exists():
-            series = _gps_series_from_gnss_csv(gnss_csv_path)
+            if utc_anchor_dt is not None:
+                series = _gps_series_canonical(gnss_csv_path, utc_anchor_dt)
+            if not series:
+                series = _gps_series_from_gnss_csv(gnss_csv_path)
         if not series and (nmea_path is not None and nmea_path.exists()):
             series = _gps_series_from_stitched_nmea(nmea_path)
 
@@ -2885,7 +3466,7 @@ def compose_preview_ffmpeg(
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="BlackVue drive stitcher (ffmpeg + blackclue + NMEA stitching)")
-    ap.add_argument("--source", required=True, type=Path, help="Source directory containing MP4 files")
+    ap.add_argument("--source", type=Path, default=None, help="Source directory containing MP4 files (omit when using --clips-from)")
     ap.add_argument("--output", required=True, type=Path, help="Output directory (Processed root)")
     ap.add_argument("--vehicle", default=None, help="Vehicle tag for naming (default: last folder name of --source)")
 
@@ -3073,9 +3654,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-hvc1-tag", action="store_true", help="Do not set -tag:v hvc1 for HEVC MP4 outputs (some players prefer it).")
     # optional limiting for testing
     ap.add_argument("--limit-drives", type=int, default=0, help="Process only the first N drives (0=all)")
-    ap.add_argument("--skip-existing", action="store_true", help="Skip processing a drive/view if the manifest file already exists in the output folder (resume mode).")
+    ap.add_argument("--skip-existing", action="store_true", help="Skip a drive when the output folder already holds the same clips built with the same options (resume mode).")
+
+    # pipeline integration: build one already-identified drive
+    ap.add_argument("--clips-from", type=Path, default=None,
+                    help="Text file listing one clip path per line to process instead of scanning --source (blank lines and # comments ignored).")
+    ap.add_argument("--drive-tag", default=None,
+                    help="Use this exact drive tag (YYYYMMDD_HHMMSS_<vehicle>) instead of deriving it from the first clip, and treat the clips as a single drive.")
+    ap.add_argument("--drive-session-id", default=None,
+                    help="Expected drive_session_id; the run fails when it does not match the id derived from the vehicle and drive tag.")
+    ap.add_argument("--batch-id", default=None,
+                    help="Pipeline batch id, recorded in the manifest.")
+    ap.add_argument("--camera-utc-offset", default=DEFAULT_CAMERA_UTC_OFFSET,
+                    help=("Fixed offset of the camera clock from UTC, e.g. -06:00 (default: "
+                          f"{DEFAULT_CAMERA_UTC_OFFSET}). The camera has no daylight saving, so this is used "
+                          "instead of --timezone whenever a time comes from a clip filename or the camera RTC."))
+    ap.add_argument("--max-failed-clip-ratio", type=float, default=0.2,
+                    help="Fail the drive when more than this fraction of its clips fail telemetry extraction (default: 0.2).")
 
     args = ap.parse_args(argv)
+
+    if not args.source and not args.clips_from:
+        raise SystemExit("One of --source or --clips-from is required.")
+    if args.clips_from and not args.vehicle:
+        raise SystemExit("--clips-from requires --vehicle (there is no source folder name to fall back on).")
+    try:
+        camera_tz = parse_utc_offset(args.camera_utc_offset)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     if args.telemetry_date_source == "nmea" and not args.run_blackclue:
         raise SystemExit("--telemetry-date-source nmea requires --run-blackclue (otherwise there is no NMEA timestamp to derive date folders).")
@@ -3119,10 +3725,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "--output-layout import: --blackclue-view / --timelapse-view / --stills-view must all match (front or rear)."
             )
 
-    source = args.source.resolve()
+    source = args.source.resolve() if args.source else None
     output = args.output.resolve()
 
-    vehicle_tag = sanitize_tag(args.vehicle or source.name)
+    vehicle_tag = sanitize_tag(args.vehicle or (source.name if source else ""))
 
     if args.output_layout == "import":
         # Import layout: <output>/<vehicle>/<drive_tag>_<view>/...
@@ -3152,24 +3758,47 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # That can accidentally exclude legitimate input folders that share a common name (e.g. "Interesting").
     # Instead, if the output path is inside the source path, exclude the output *path* precisely.
     exclude_paths: List[Path] = []
-    if args.recurse:
+    if args.recurse and source is not None:
         try:
             output.resolve().relative_to(source.resolve())
             exclude_paths.append(output.resolve())
         except Exception:
             pass
 
-    pairs = scan_pairs(source, args.recurse, sorted(exclude_dirs), exclude_paths=exclude_paths)
+    if args.clips_from:
+        pairs = pairs_from_clip_list(args.clips_from)
+    else:
+        pairs = scan_pairs(source, args.recurse, sorted(exclude_dirs), exclude_paths=exclude_paths)
     if not pairs:
         print("No matching MP4 clips found.")
         return 1
 
-    # Validate data integrity: a rear clip without a matching front clip is almost always a partial copy/corruption.
+    # A rear clip with no matching front clip usually means a partial copy. Older
+    # versions aborted the entire run; the pipeline needs the rest of the drive, so
+    # the clip is dropped and recorded in the manifest's clips_excluded instead.
     orphan_rears = [p.rear for p in pairs if p.rear is not None and p.front is None]
+    excluded_by_ts: Dict[str, List[Dict[str, object]]] = {}
     if orphan_rears:
-        sample = "\n".join(f"  - {p}" for p in orphan_rears[:10])
-        more = "" if len(orphan_rears) <= 10 else f"\n  ... and {len(orphan_rears) - 10} more"
-        raise SystemExit(f"Rear clip(s) found without matching front clip:\n{sample}{more}")
+        eprint(f"[WARN] {len(orphan_rears)} rear clip(s) have no matching front clip and are excluded:")
+        for p in orphan_rears[:10]:
+            eprint(f"  - {p}")
+        if len(orphan_rears) > 10:
+            eprint(f"  ... and {len(orphan_rears) - 10} more")
+        for p in orphan_rears:
+            parsed = parse_timestamp_from_name(p.name)
+            key = parsed[0] if parsed else p.stem
+            excluded_by_ts.setdefault(key, []).append(
+                {
+                    "clip_name": p.stem,
+                    "channel": "rear",
+                    "reason": "orphan_rear",
+                    "detail": "no matching front clip",
+                }
+            )
+        pairs = [
+            ClipPair(ts_key=p.ts_key, ts_dt=p.ts_dt, front=p.front, rear=(p.rear if p.front else None))
+            for p in pairs
+        ]
 
     if args.front_only:
         # Keep only pairs that have a front clip; ignore any paired rears entirely.
@@ -3179,7 +3808,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise SystemExit("--front-only: --blackclue-view must be 'front'")
         if args.run_map_render and args.map_view != "front":
             raise SystemExit("--front-only: --map-view must be 'front' (or omit --run-map-render)")
-    drives = split_into_drives(pairs, args.gap_seconds)
+
+    if args.drive_tag:
+        # The caller already decided which clips form this drive.
+        drives = [list(pairs)]
+    else:
+        drives = split_into_drives(pairs, args.gap_seconds)
 
     total_clips = sum((1 if p.front else 0) + (1 if p.rear else 0) for p in pairs)
     print(f"Found {total_clips} clips across {len(pairs)} timestamps. Split into {len(drives)} drive(s).")
@@ -3195,6 +3829,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     max_drives = args.limit_drives if args.limit_drives and args.limit_drives > 0 else len(drives)
 
+    # Drives are rebuilt when the options that shape their output change.
+    signature, signature_payload = args_signature(args)
+    n_done = 0
+    n_skipped = 0
+    n_no_accel = 0
+
     for i, drive in enumerate(drives[:max_drives], start=1):
         drive_id = f"drive_{i:03d}"
         start_dt = drive[0].ts_dt
@@ -3202,8 +3842,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         approx_duration_s = (end_dt - start_dt).total_seconds() + float(args.clip_seconds)
 
         # Skip short drives (garage shuffle). Useful to avoid clutter in archives.
-        if (args.min_drive_seconds and args.min_drive_seconds > 0 and approx_duration_s < float(args.min_drive_seconds)) or (
-            args.min_drive_clips and args.min_drive_clips > 0 and len(drive) < int(args.min_drive_clips)
+        # An explicit --drive-tag means the caller already classified this drive.
+        if (not args.drive_tag) and (
+            (args.min_drive_seconds and args.min_drive_seconds > 0 and approx_duration_s < float(args.min_drive_seconds))
+            or (args.min_drive_clips and args.min_drive_clips > 0 and len(drive) < int(args.min_drive_clips))
         ):
             why = []
             if args.min_drive_seconds and args.min_drive_seconds > 0:
@@ -3211,6 +3853,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.min_drive_clips and args.min_drive_clips > 0:
                 why.append(f"clips={len(drive)}<{int(args.min_drive_clips)}")
             print(f"{drive_id} ({start_dt:%Y%m%d_%H%M%S}_{vehicle_tag}): skipped short drive ({', '.join(why)})")
+            n_skipped += 1
             continue
 
         # Video output folders (legacy behavior). In import layout, these are under <output>/_video/<vehicle>/...
@@ -3250,35 +3893,89 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         if args.output_layout == "import":
-            tag = base_tag
-            n = 1
-            while True:
-                drive_folder = tele_proc_root / f"{tag}_{primary_view}"
-                work_folder = work_date_root / f"{tag}_{primary_view}"
-                # (Optional) also avoid collisions with video outputs if they exist.
-                vid_candidate = (date_dir / f"{tag}.mp4")
-                if not (drive_folder.exists() or work_folder.exists() or vid_candidate.exists()):
-                    break
-                n += 1
-                tag = f"{base_tag}_{n:02d}"
+            # Deterministic: the same clips always produce the same tag, and so the
+            # same drive_session_id. (The old loop appended _02/_03 whenever a
+            # folder already existed, which minted a new id on every re-run and put
+            # duplicate copies of the same drive in the database.)
+            tag = args.drive_tag or base_tag
         else:
             tag = make_unique_drive_tag(base_tag, final_dir=date_dir, work_root=work_date_root, tele_root=tele_date_dir_guess)
 
-        # Working/staging files (concat lists, stitched intermediates, etc.)
+        if args.drive_session_id:
+            expected_sid = _stable_drive_session_id(vehicle_tag=vehicle_tag, drive_tag=tag)
+            if str(args.drive_session_id) != expected_sid:
+                raise SystemExit(
+                    f"--drive-session-id {args.drive_session_id} does not match {expected_sid} "
+                    f"for vehicle {vehicle_tag!r} and drive tag {tag!r}"
+                )
+
+        # Which clips this drive is made of, and anything already excluded from it.
+        drive_front = [p.front for p in drive if p.front]
+        drive_rear = [] if args.front_only else [p.rear for p in drive if p.rear]
+        clip_stems = [p.stem for p in (drive_front + drive_rear)]
+        excluded_clips: List[Dict[str, object]] = []
+        for p in drive:
+            excluded_clips.extend(excluded_by_ts.get(p.ts_key, []))
+
+        tele_view_for_manifest = args.blackclue_view if args.run_blackclue else primary_view
+        manifest_name = render_manifest_filename(args.manifest_filename, tag=tag, view=tele_view_for_manifest)
+
+        final_dir = tele_proc_root / (f"{tag}_{primary_view}" if args.output_layout == "import" else tag)
         work_dir = work_date_root / (f"{tag}_{primary_view}" if args.output_layout == "import" else tag)
-        if not args.dry_run:
-            work_dir.mkdir(parents=True, exist_ok=True)
+        build_dir = work_date_root / f"{tag}_{primary_view}{BUILD_DIR_SUFFIX}"
 
-        tele_dir = tele_proc_root / (f"{tag}_{primary_view}" if args.output_layout == "import" else tag)
-
-
-        # Resume support: optionally skip drives already processed (manifest exists).
+        # Resume support: decide before creating anything on disk, so that a skip
+        # really does leave every folder untouched.
         if getattr(args, "skip_existing", False):
-            tele_view_for_manifest = args.blackclue_view if args.run_blackclue else primary_view
-            manifest_exists_path = tele_dir / render_manifest_filename(args.manifest_filename, tag=tag, view=tele_view_for_manifest)
-            if manifest_exists_path.exists():
-                print(f"{drive_id} ({tag}_{tele_view_for_manifest}): skipped (manifest exists)")
-                continue
+            if args.output_layout == "import":
+                action, reason = drive_build_decision(
+                    final_dir,
+                    manifest_name=manifest_name,
+                    clip_stems=clip_stems,
+                    signature=signature,
+                )
+                if action in ("skip", "adopt"):
+                    if action == "adopt" and not args.dry_run:
+                        # Folder predates the completion marker but holds exactly
+                        # these clips: keep it and record the marker now.
+                        write_complete_marker(final_dir, {
+                            "schema": 1,
+                            "drive_tag": tag,
+                            "view": primary_view,
+                            "vehicle_tag": vehicle_tag,
+                            "drive_session_id": _stable_drive_session_id(vehicle_tag=vehicle_tag, drive_tag=tag),
+                            "clip_set_sha1": clip_set_sha1(clip_stems),
+                            "clip_count": len(clip_stems),
+                            "args_signature": signature,
+                            "args": signature_payload,
+                            "script_version": SCRIPT_VERSION,
+                            "completed_utc": _utc_now_iso_z(),
+                            "result": "adopted",
+                            "manifest": manifest_name,
+                        })
+                    print(f"{drive_id} ({tag}_{tele_view_for_manifest}): skipped ({reason})")
+                    n_skipped += 1
+                    continue
+            else:
+                if (final_dir / manifest_name).exists():
+                    print(f"{drive_id} ({tag}_{tele_view_for_manifest}): skipped (manifest exists)")
+                    n_skipped += 1
+                    continue
+
+        # Everything for this drive is written into a build folder and swapped into
+        # place at the very end, so a crash or a kill never leaves a half-written
+        # drive folder where the importer would find it.
+        if args.output_layout == "import":
+            if not args.dry_run:
+                rmtree_retry(build_dir)  # leftovers from an interrupted run
+                build_dir.mkdir(parents=True, exist_ok=True)
+                work_dir.mkdir(parents=True, exist_ok=True)
+            tele_dir = build_dir
+        else:
+            if not args.dry_run:
+                work_dir.mkdir(parents=True, exist_ok=True)
+            tele_dir = final_dir
+
         tele_clips_dir = (tele_dir / "artifacts" / "clips") if args.output_layout == "import" else (tele_dir / "Clips")
         tele_start_ms = None  # earliest GPS epoch-ms seen in this drive (used for telemetry date folders)
         derived_params = dict(DEFAULT_DERIVED_PARAMS)
@@ -3326,12 +4023,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 tele_dir.mkdir(parents=True, exist_ok=True)
                 tele_clips_dir.mkdir(parents=True, exist_ok=True)
 
+            failed_clips: List[Tuple[Path, str]] = []
+            blackclue_attempted = 0
+
             def process_view(paths: Sequence[Path]) -> List[Path]:
+                nonlocal blackclue_attempted
+                blackclue_attempted += len(paths)
                 modes = ["complete", "raw"] if args.blackclue_mode == "both" else [args.blackclue_mode]
 
                 def one_clip(mp4: Path) -> Optional[Path]:
-                    for m in modes:
-                        run_blackclue(blackclue_exe, m, mp4, dry_run=args.dry_run, verbose=args.verbose)
+                    try:
+                        for m in modes:
+                            run_blackclue(blackclue_exe, m, mp4, dry_run=args.dry_run, verbose=args.verbose)
+                    except Exception as exc:
+                        # One unreadable clip should not cost the whole drive: it is
+                        # excluded here, and the failure ratio is checked below.
+                        eprint(f"  [WARN] blackclue failed on {mp4.name}: {exc}")
+                        failed_clips.append((mp4, str(exc)))
+                        return None
 
                     nmea_src = mp4.with_suffix(".nmea")
                     sidecars = collect_sidecars(mp4)
@@ -3374,6 +4083,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 front_nmea_files = process_view(front_paths)
             if args.blackclue_view in ("rear", "both"):
                 rear_nmea_files = process_view(rear_paths)
+
+            if failed_clips:
+                failed_ratio = len(failed_clips) / max(1, blackclue_attempted)
+                for mp4, msg in failed_clips:
+                    excluded_clips.append(
+                        {
+                            "clip_name": mp4.stem,
+                            "channel": "front" if is_front_or_rear(mp4) == "F" else "rear",
+                            "reason": "blackclue_failed",
+                            "detail": msg[:200],
+                        }
+                    )
+                if failed_ratio > float(args.max_failed_clip_ratio):
+                    raise RuntimeError(
+                        f"{len(failed_clips)} of {blackclue_attempted} clips failed telemetry "
+                        f"extraction ({failed_ratio:.0%}, limit {float(args.max_failed_clip_ratio):.0%})"
+                    )
+                eprint(
+                    f"  [WARN] continuing without {len(failed_clips)} clip(s) "
+                    f"({failed_ratio:.0%} of this drive)"
+                )
+                failed_set = {mp4 for mp4, _ in failed_clips}
+                front_paths = [p for p in front_paths if p not in failed_set]
+                rear_paths = [p for p in rear_paths if p not in failed_set]
+                clip_stems = [p.stem for p in (front_paths + rear_paths)]
+                # The stitched video must not include clips we dropped.
+                write_concat_list(front_list, front_paths, dry_run=args.dry_run)
+                write_concat_list(rear_list, rear_paths, dry_run=args.dry_run)
 
         stitched_front: Optional[Path] = None
         stitched_rear: Optional[Path] = None
@@ -3420,6 +4157,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             write_accel_csv(out_accel, accel)
                 except Exception as e:
                     print(f"  [WARN] accel export failed for {tag}: {e}")
+
+        # --- Session anchor and clip timeline -------------------------------
+        # Computed once here and reused by the stills naming, the event
+        # extraction and the manifest, so every timestamp for this drive comes
+        # from the same clock.
+        gnss_csv_for_drive = tele_dir / f"{tag}_{primary_view}.csv"
+        accel_csv_for_drive = tele_dir / f"{tag}_{primary_view}_accel.csv"
+
+        clip_durations: Dict[Path, Optional[float]] = {}
+        if not args.dry_run:
+            ffprobe_for_durations = _resolve_ffprobe(args.ffprobe, ffmpeg_exe or "")
+            probe_durations(ffprobe_for_durations, list(front_paths) + list(rear_paths), clip_durations)
+
+        session_time = compute_session_time(
+            gnss_csv=gnss_csv_for_drive if gnss_csv_for_drive.exists() else None,
+            accel_csv=accel_csv_for_drive if accel_csv_for_drive.exists() else None,
+            clip_paths=front_paths or rear_paths,
+            camera_tz=camera_tz,
+            clip_seconds=float(args.clip_seconds),
+            durations=clip_durations,
+        )
+        session_start_ts_utc = session_time.get("start_ts_utc")
+        clock_offset_s = float(session_time.get("clock_offset_s") or 0.0)
+        front_segments = build_clip_segments(
+            front_paths, camera_tz=camera_tz, clock_offset_s=clock_offset_s,
+            clip_seconds=float(args.clip_seconds), durations=clip_durations,
+        )
+        rear_segments = build_clip_segments(
+            rear_paths, camera_tz=camera_tz, clock_offset_s=clock_offset_s,
+            clip_seconds=float(args.clip_seconds), durations=clip_durations,
+        )
+        print(
+            f"  start {session_time.get('start_ts_utc')} "
+            f"({session_time.get('time_confidence')}, "
+            f"{session_time.get('gnss_valid_rows')} fixed GNSS rows, "
+            f"camera clock {session_time.get('filename_delta_s')}s)"
+        )
 
         front_out: Optional[Path] = None
         rear_out: Optional[Path] = None
@@ -3578,13 +4352,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         gnss_csv_path = tele_dir / f"{tag}_{primary_view}.csv"
                         nmea_anchor_path = tele_dir / f"{tag}_{primary_view}.nmea"
 
-                        # Compute video t=0 UTC anchor for stills GPS synchronization.
-                        # This MUST match the manifest's session_time.start_ts_utc.
-                        _stills_session_start = _compute_video_start_utc(
-                            gnss_csv_path=gnss_csv_path,
-                            nmea_path=nmea_anchor_path,
-                        )
-
+                        # Stills share the manifest's anchor and per-clip timeline,
+                        # so their timestamps line up with the GNSS and accelerometer
+                        # rows in the database.
                         rename_stills_with_timestamps(
                             thumbs_dir=out_dir,
                             paths=list(paths_for_view),
@@ -3595,9 +4365,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             write_index=write_index,
                             nmea_path=nmea_anchor_path,
                             gnss_csv_path=gnss_csv_path,
-                            session_start_ts_utc=_stills_session_start,
+                            session_start_ts_utc=session_start_ts_utc,
                             write_geojson=bool(getattr(args, "stills_geojson", False)),
                             dry_run=args.dry_run,
+                            segments=(front_segments if view == "front" else rear_segments),
+                            camera_utc_offset=args.camera_utc_offset,
                         )
 
                 if args.stills_view in ("front", "both"):
@@ -3615,20 +4387,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     ev_records = nmea_to_records(ev_nmea.read_text(encoding="utf-8", errors="replace"))
                     
-                    video_start_ts_utc = None
-                    try:
-                        gnss_candidate = tele_dir / f"{tag}_{primary_view}.csv"
-                        if gnss_candidate.exists():
-                            gi = _analyze_gnss_csv(gnss_candidate)
-                            a_iso = gi.get("gnss_anchor_ts_utc")
-                            a_t = gi.get("gnss_anchor_t_rel_s")
-                            if a_iso and a_t is not None:
-                                adt = _parse_iso_z_dt(str(a_iso))
-                                if adt is not None:
-                                    vs = adt.astimezone(_dt.timezone.utc) - _dt.timedelta(seconds=float(a_t))
-                                    video_start_ts_utc = vs.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                    except Exception:
-                        video_start_ts_utc = None
+                    # Same anchor as the manifest and the stills.
+                    video_start_ts_utc = str(session_start_ts_utc) if session_start_ts_utc else None
 
                     events = derive_events_from_nmea_records(ev_records, derived_params, video_start_ts_utc=video_start_ts_utc)
                 except Exception as e:
@@ -3836,22 +4596,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             nmea_candidate = tele_dir / f"{tag}_{tele_view}.nmea"
             nmea_path = nmea_candidate if nmea_candidate.exists() else None
 
-            # Build clip entries. We include rear clips too, but timestamps may be null
-            # if we did not run blackclue for that channel.
+            # Clip times come from each clip's filename, corrected by the drive's
+            # measured camera-clock error, with the measured clip length. Reading
+            # them out of the per-clip NMEA sidecar (as before) picked up the same
+            # stale pre-lock rows that made session starts wrong, and gave every
+            # parking clip in a drive the same one-second span.
             clip_entries: List[Dict[str, object]] = []
-            for ch, paths in (("front", front_paths), ("rear", rear_paths)):
+            for ch, paths, segs in (
+                ("front", front_paths, front_segments),
+                ("rear", rear_paths, rear_segments),
+            ):
+                seg_by_path = {s.path: s for s in segs}
                 for mp4 in paths:
-                    if args.telemetry_sidecar_action != "none":
-                        sidecar_nmea = tele_clips_dir / f"{mp4.stem}.nmea"
-                    else:
-                        sidecar_nmea = mp4.with_suffix(".nmea")
-                    start_iso, end_iso = _parse_clip_bounds_from_sidecar(sidecar_nmea)
+                    seg = seg_by_path.get(mp4)
+                    start_dt_clip = seg.start_utc if seg else None
+                    dur_clip = seg.duration_s if seg else None
                     clip_entries.append(
                         {
                             "channel": ch,
                             "clip_name": mp4.stem,
-                            "start_ts_utc": start_iso,
-                            "end_ts_utc": end_iso,
+                            "type": clip_type_from_name(mp4.name),
+                            "start_ts_utc": _iso_z_seconds(start_dt_clip),
+                            "end_ts_utc": (
+                                _iso_z_seconds(start_dt_clip + _dt.timedelta(seconds=float(dur_clip)))
+                                if (start_dt_clip is not None and dur_clip)
+                                else None
+                            ),
+                            "duration_s": round(float(dur_clip), 3) if dur_clip else None,
                             "video_path": None,
                         }
                     )
@@ -3881,9 +4652,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     stills_view=args.stills_view,
                     stills_every_seconds=float(args.stills_every_seconds),
                     dry_run=args.dry_run,
+                    session_time=session_time,
+                    drive_session_id=args.drive_session_id,
+                    clip_set_hash=clip_set_sha1(clip_stems),
+                    clips_excluded=excluded_clips,
+                    clock_utc_offset=args.camera_utc_offset,
+                    pipeline_info={"batch_id": args.batch_id, "script_version": SCRIPT_VERSION},
                 )
                 print(f"  manifest -> {manifest_path.relative_to(output)}")
 
+        # --- Finish the drive ------------------------------------------------
+        # The marker is written last inside the build folder, then the folder is
+        # swapped into place in one atomic rename.
+        accel_ok = bool(accel_csv_for_drive.exists())
+        result = "ok" if accel_ok else "no_accel_csv"
+        if not accel_ok and not args.dry_run:
+            n_no_accel += 1
+            eprint(f"  [WARN] {tag}: no accelerometer CSV; the database loader requires one")
+
+        if args.output_layout == "import" and not args.dry_run:
+            write_complete_marker(build_dir, {
+                "schema": 1,
+                "drive_tag": tag,
+                "view": primary_view,
+                "vehicle_tag": vehicle_tag,
+                "drive_session_id": _stable_drive_session_id(vehicle_tag=vehicle_tag, drive_tag=tag),
+                "clip_set_sha1": clip_set_sha1(clip_stems),
+                "clip_count": len(clip_stems),
+                "clips_excluded": len(excluded_clips),
+                "args_signature": signature,
+                "args": signature_payload,
+                "script_version": SCRIPT_VERSION,
+                "batch_id": args.batch_id,
+                "completed_utc": _utc_now_iso_z(),
+                "result": result,
+                "manifest": manifest_name,
+                "session_time": session_time,
+            })
+            swap_build_into_place(build_dir, final_dir, retire_root=work_date_root)
+            rmtree_retry(work_dir)
+            print(f"{drive_id} ({tag}_{primary_view}): {result} -> {final_dir.relative_to(output)}")
+
+        n_done += 1
+
+    summary = f"Drives: {n_done} built, {n_skipped} skipped"
+    if n_no_accel:
+        summary += f", {n_no_accel} without an accelerometer CSV"
+    print(summary)
+
+    # Exit codes the pipeline reads: 0 done, 3 nothing to do, 4 built but the
+    # database loader will reject it, anything else a failure.
+    if n_done == 0 and n_skipped > 0:
+        return 3
+    if n_no_accel:
+        return 4
     return 0
 
 
