@@ -733,8 +733,10 @@ def pairs_from_clip_list(list_file: Path) -> List[ClipPair]:
     by_dt: Dict[str, _dt.datetime] = {}
     missing: List[str] = []
 
-    for raw in list_file.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
+    # utf-8-sig: PowerShell's "-Encoding UTF8" and Notepad both start the file
+    # with a byte-order mark, which would otherwise be glued onto the first path.
+    for raw in list_file.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip().strip('"')
         if not line or line.startswith("#"):
             continue
         p = Path(line)
@@ -3591,7 +3593,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             drives_root.mkdir(parents=True, exist_ok=True)
         work_root.mkdir(parents=True, exist_ok=True)
         tele_root.mkdir(parents=True, exist_ok=True)
-        tele_tmp_root.mkdir(parents=True, exist_ok=True)
+        if args.output_layout != "import":
+            # The temporary telemetry root is a legacy-layout concept only.
+            tele_tmp_root.mkdir(parents=True, exist_ok=True)
     # default exclusions: "Processed" plus anything user added
     exclude_dirs = set([d for d in args.exclude_dir if d])
     exclude_dirs.add("Processed")

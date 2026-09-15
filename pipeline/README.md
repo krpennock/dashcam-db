@@ -69,6 +69,10 @@ clips and the same processing options. A folder built before markers existed is
 "adopted" (kept, and given a marker) when its manifest lists exactly the same
 clips. Anything else is rebuilt.
 
+A killed run leaves its `.build` folder behind in `_work/`, and it is deleted the
+next time that drive is rebuilt. Nothing else reads it, and the finished drive
+folder from the previous run is left exactly as it was.
+
 ## How times are worked out
 
 Both cameras run on a fixed UTC-6 clock with no daylight saving, drifting a few

@@ -274,6 +274,19 @@ class ClipListTests(unittest.TestCase):
             self.assertIsNotNone(pairs[0].rear)
             self.assertIsNone(pairs[1].rear)
 
+    def test_byte_order_mark_and_quotes_are_tolerated(self):
+        """PowerShell's -Encoding UTF8 writes a BOM, and paths are often quoted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clip = root / "20260806_094436_NF.mp4"
+            clip.write_bytes(b"")
+            listing = root / "clips.txt"
+            listing.write_text('﻿"' + str(clip) + '"\n', encoding="utf-8")
+
+            pairs = bd.pairs_from_clip_list(listing)
+            self.assertEqual(len(pairs), 1)
+            self.assertEqual(pairs[0].front, clip)
+
     def test_missing_clip_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             listing = Path(tmp) / "clips.txt"
