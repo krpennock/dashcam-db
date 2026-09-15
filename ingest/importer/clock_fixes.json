@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "Manual camera-clock corrections for the one-off database repair.",
+    "",
+    "On 2026-01-06..08 the Civic camera's own clock was running about five hours",
+    "slow. Five drives from those days carry enough satellite fixes to measure the",
+    "error directly (listed under measured_from), and the repair takes their GPS",
+    "time as the truth. The drives listed under tags are from the same window but",
+    "have too few usable fixes to measure anything, so without this file the repair",
+    "would fall back to the very clock that was wrong and place them five hours",
+    "early. Their corrected start is the clip filename time plus offset_s, and they",
+    "are recorded as time_confidence = filename_estimated_clock_offset so it stays",
+    "visible that the time was inferred rather than measured.",
+    "",
+    "Approved by the owner on 2026-09-15 after reviewing the repair report."
+  ],
+  "offset_s": 18012.6,
+  "offset_measured": {
+    "method": "median of (GPS median anchor - filename time) over the drives below",
+    "samples_s": [18031.846, 18012.072, 18011.941, 18023.531, 18012.606],
+    "spread_s": 19.9
+  },
+  "measured_from": [
+    "20260107_041909_civic",
+    "20260107_061900_civic",
+    "20260107_065432_civic",
+    "20260108_041058_civic",
+    "20260108_105057_civic"
+  ],
+  "tags": [
+    "20260106_151554_civic",
+    "20260107_184044_civic",
+    "20260107_190201_civic",
+    "20260108_022312_civic"
+  ]
+}
