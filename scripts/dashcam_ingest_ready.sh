@@ -116,9 +116,17 @@ for VEHICLE in "${VEHICLES[@]}"; do
     fi
 
     if $SUDO $COMPOSE --profile tools run --rm ingest "$container_manifest"; then
+      if [[ -d "$DONE_DIR/$name" ]]; then
+        echo "WARN: $DONE_DIR/$name already exists, renaming old to ${name}.prev_$(date +%Y%m%d%H%M%S)"
+        mv "$DONE_DIR/$name" "$DONE_DIR/${name}.prev_$(date +%Y%m%d%H%M%S)"
+      fi
       mv "$d" "$DONE_DIR/"
       count_ok=$((count_ok + 1))
     else
+      if [[ -d "$FAILED_DIR/$name" ]]; then
+        echo "WARN: $FAILED_DIR/$name already exists, renaming old to ${name}.prev_$(date +%Y%m%d%H%M%S)"
+        mv "$FAILED_DIR/$name" "$FAILED_DIR/${name}.prev_$(date +%Y%m%d%H%M%S)"
+      fi
       mv "$d" "$FAILED_DIR/"
       count_fail=$((count_fail + 1))
     fi
