@@ -799,74 +799,6 @@ def _dt_to_iso_utc(x: Optional[_dt.datetime]) -> Optional[str]:
     return x.astimezone(_dt.timezone.utc).isoformat()
 
 
-def _clip_bounds_from_sidecar_nmea(nmea_path: Path) -> Tuple[Optional[_dt.datetime], Optional[_dt.datetime]]:
-    """Best-effort (start,end) UTC timestamps for a clip from its blackclue .nmea sidecar.
-
-    Prefers parsed NMEA RMC-derived utc_time; falls back to the bracketed epoch ms when needed.
-    """
-    try:
-        txt = nmea_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return (None, None)
-
-    try:
-        recs = nmea_to_records(txt)
-    except Exception:
-        recs = []
-
-    if not recs:
-        return (None, None)
-
-    def _parse_iso_any(s: str) -> Optional[_dt.datetime]:
-        s = (s or "").strip()
-        if not s:
-            return None
-        try:
-            if s.endswith("Z"):
-                return _dt.datetime.fromisoformat(s[:-1] + "+00:00")
-            return _dt.datetime.fromisoformat(s)
-        except Exception:
-            return None
-
-    dts: List[_dt.datetime] = []
-    for r in recs:
-        utc_s = (r.get("utc_time") or "").strip()
-        dt = _parse_iso_any(utc_s) if utc_s else None
-
-        if dt is None:
-            try:
-                ms_i = int(r.get("ms"))
-                dt = _dt.datetime.fromtimestamp(ms_i / 1000.0, tz=_dt.timezone.utc)
-            except Exception:
-                dt = None
-
-        if dt is not None:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=_dt.timezone.utc)
-            dts.append(dt.astimezone(_dt.timezone.utc))
-
-    if not dts:
-        return (None, None)
-
-    return (min(dts), max(dts))
-
-
-def _parse_clip_bounds_from_sidecar(nmea_path: Path) -> Tuple[Optional[str], Optional[str]]:
-    """Return (start_iso, end_iso) from a blackclue .nmea sidecar.
-
-    The underlying parser returns timezone-aware datetimes. We emit ISO 8601 strings
-    with an explicit UTC offset ("+00:00") so the manifest is portable.
-    """
-
-    start_dt, end_dt = _clip_bounds_from_sidecar_nmea(nmea_path)
-    if start_dt is None:
-        return (None, None)
-    if end_dt is None:
-        end_dt = start_dt
-    return (start_dt.isoformat(), end_dt.isoformat())
-
-
-
 def _utc_now_iso_z() -> str:
     """Return current UTC timestamp like 2026-02-13T01:23:45Z."""
     return (
@@ -1884,53 +1816,6 @@ def run_ffmpeg_stills(
     if rc != 0:
         raise RuntimeError(f"ffmpeg still extraction failed (exit {rc}) into: {out_dir}")
 
-def _segments_for_paths(
-    *,
-    paths: List[Path],
-    tz_name: str,
-    clip_seconds: float,
-) -> List[Tuple[float, _dt.datetime, Path]]:
-    """Return list of (concat_start_s, real_start_local_dt, clip_path) for mapping concat offsets -> real time."""
-    tz = _try_zoneinfo(tz_name)
-    if tz is None:
-        # Fallback to the system local timezone (works on Windows without IANA tzdata).
-        tz = _dt.datetime.now().astimezone().tzinfo or _dt.timezone.utc
-    segs: List[Tuple[float, _dt.datetime, Path]] = []
-    t_concat = 0.0
-    for p in paths:
-        ts = parse_timestamp_from_name(p.name)
-        if not ts:
-            continue
-        _, naive = ts
-        real_local = naive.replace(tzinfo=tz)
-        segs.append((t_concat, real_local, p))
-        t_concat += float(clip_seconds)
-    return segs
-
-
-def _real_time_for_offset(
-    *,
-    segs: List[Tuple[float, _dt.datetime, Path]],
-    offset_s: float,
-    clip_seconds: float,
-) -> Tuple[_dt.datetime, Path, float]:
-    """Map a concat timeline offset (seconds) to a local datetime using clip boundaries."""
-    if not segs:
-        raise ValueError("No segments available for still timestamp mapping.")
-    # Find last segment with start <= offset_s
-    last = segs[0]
-    for s in segs:
-        if s[0] <= offset_s:
-            last = s
-        else:
-            break
-    seg_start_s, real_start_local, clip_path = last
-    within = max(0.0, float(offset_s) - float(seg_start_s))
-    # Clamp within a clip; extraction won't exceed but protect anyway.
-    within = min(within, float(clip_seconds))
-    return (real_start_local + _dt.timedelta(seconds=within), clip_path, within)
-
-
 def _parse_iso_z_dt(s: str) -> Optional[_dt.datetime]:
     s = (s or "").strip()
     if not s:
@@ -1941,49 +1826,6 @@ def _parse_iso_z_dt(s: str) -> Optional[_dt.datetime]:
         return _dt.datetime.fromisoformat(s)
     except Exception:
         return None
-
-
-def _compute_video_start_utc(
-    *,
-    gnss_csv_path: Optional[Path] = None,
-    nmea_path: Optional[Path] = None,
-) -> Optional[str]:
-    """Compute video t=0 UTC timestamp from GNSS CSV anchor or stitched NMEA.
-
-    Uses the same anchor logic as manifest session_time: anchor_utc - anchor_t_rel_s.
-    Returns ISO 8601 string with Z suffix, or None.
-    """
-    # 1) Prefer GNSS CSV clustered anchor (most robust)
-    if gnss_csv_path is not None and gnss_csv_path.exists():
-        try:
-            info = _analyze_gnss_csv(gnss_csv_path)
-            a_iso = info.get("gnss_anchor_ts_utc")
-            a_t = info.get("gnss_anchor_t_rel_s")
-            if a_iso and a_t is not None:
-                adt = _parse_iso_z_dt(str(a_iso))
-                if adt is not None:
-                    vs = adt.astimezone(_dt.timezone.utc) - _dt.timedelta(seconds=float(a_t))
-                    return vs.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        except Exception:
-            pass
-
-    # 2) Derive from stitched NMEA: first valid record's utc_time - t_rel_s
-    if nmea_path is not None and nmea_path.exists():
-        try:
-            txt = nmea_path.read_text(encoding="utf-8", errors="replace")
-            recs = nmea_to_records(txt)
-            for r in recs:
-                utc_s = r.get("utc_time")
-                trel = r.get("t_rel_s")
-                if utc_s and trel is not None:
-                    adt = _parse_iso_z_dt(utc_s)
-                    if adt is not None:
-                        vs = adt.astimezone(_dt.timezone.utc) - _dt.timedelta(seconds=float(trel))
-                        return vs.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-        except Exception:
-            pass
-
-    return None
 
 
 def _gps_series_from_gnss_csv(gnss_csv: Path) -> List[Tuple[_dt.datetime, float, float, dict]]:
@@ -4188,11 +4030,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             rear_paths, camera_tz=camera_tz, clock_offset_s=clock_offset_s,
             clip_seconds=float(args.clip_seconds), durations=clip_durations,
         )
+        _delta = session_time.get("filename_delta_s")
         print(
             f"  start {session_time.get('start_ts_utc')} "
             f"({session_time.get('time_confidence')}, "
             f"{session_time.get('gnss_valid_rows')} fixed GNSS rows, "
-            f"camera clock {session_time.get('filename_delta_s')}s)"
+            + (f"camera clock off by {float(_delta):+.0f}s)" if _delta is not None else "camera clock not compared)")
         )
 
         front_out: Optional[Path] = None
