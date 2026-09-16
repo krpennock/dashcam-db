@@ -38,6 +38,12 @@ ES_SYSTEM_REQUIRED = 0x00000001
 #: not scanned mid-mount.
 CONFIRM_POLLS = 2
 
+#: How often to ask the server what became of what we sent, file video whose
+#: drive has landed, and send anything still queued for the phone. This happens
+#: whether or not a card is in the reader: a card left in overnight must not stop
+#: the pipeline finishing the work it has already done.
+HOUSEKEEPING_SECONDS = 60.0
+
 
 @dataclass
 class PassResult:
@@ -419,6 +425,7 @@ def watch(cfg: Config, ledger: Ledger, *, poll_seconds: float = 5.0,
 
     seen: dict[str, int] = {}
     handled: set[str] = set()
+    last_housekeeping = 0.0
 
     while True:
         try:
@@ -440,8 +447,19 @@ def watch(cfg: Config, ledger: Ledger, *, poll_seconds: float = 5.0,
                 log(f"{key}: {result.summary}")
                 handled.add(key)
 
-            if not present:
-                confirm_deliveries(cfg, ledger, log=log)
+            # Finishing off what was already sent does not depend on the reader
+            # being empty. A delivery is confirmed a moment after it is sent, and
+            # the server is often still loading it then, so the answer has to be
+            # asked for again later -- and the video of a loaded drive cannot be
+            # filed into holding until that answer arrives. Gating this on an
+            # empty reader meant a card left in the machine stopped both for as
+            # long as it sat there.
+            now = time.monotonic()
+            if now - last_housekeeping >= HOUSEKEEPING_SECONDS:
+                last_housekeeping = now
+                if confirm_deliveries(cfg, ledger, log=log):
+                    for tag in sorted({v.tag for v in cfg.vehicles}):
+                        tidy_holding(cfg, ledger, tag, log=log)
                 notify.flush(cfg, ledger, log=log)
 
             time.sleep(poll_seconds)
