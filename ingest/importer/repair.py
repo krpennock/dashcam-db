@@ -434,10 +434,17 @@ def decide_start(session: dict[str, Any], clock_fixes: Optional[dict[str, Any]] 
     session["gps_vs_filename_s"] = gps_vs_filename
 
     if n_valid >= MIN_VALID_GPS_ROWS and anchor is not None:
+        # One vocabulary across the drives script, this tool and the loader:
+        # gnss_median, gnss_median_clock_mismatch, filename_low,
+        # filename_estimated_clock_offset. The value is written straight into
+        # drive_session.time_confidence, so the web UI only has one set of names
+        # to understand.
         session["proposed_start_ts_utc"] = anchor
-        session["method"] = "gps_median"
         session["needs_review"] = (
             gps_vs_filename is not None and abs(gps_vs_filename) > CLOCK_MISMATCH_S
+        )
+        session["method"] = (
+            "gnss_median_clock_mismatch" if session["needs_review"] else "gnss_median"
         )
     else:
         # Too few fixes to trust the satellites: the camera's own clock is the
@@ -677,8 +684,10 @@ def summarise(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                 "sessions": 0,
                 "new_id": 0,
                 "retimed_over_2_min": 0,
-                "gps_median": 0,
+                "gnss_median": 0,
+                "gnss_median_clock_mismatch": 0,
                 "filename_low": 0,
+                "filename_estimated_clock_offset": 0,
                 "needs_review": 0,
                 "no_gnss": 0,
             },
@@ -899,11 +908,17 @@ def render_markdown(report: dict[str, Any]) -> str:
     add("")
     add("How the corrected start time was decided:")
     add("")
+    labels = {
+        "gnss_median": "GPS satellite time (the reliable case)",
+        "gnss_median_clock_mismatch":
+            "GPS satellite time, but the camera's own clock disagreed by more than 15 minutes",
+        "filename_low":
+            "the drive's own name, because there were too few usable GPS readings",
+        "filename_estimated_clock_offset":
+            "the drive's own name plus a correction measured from neighbouring drives",
+    }
     for method, n in sorted(s["by_method"].items()):
-        label = ("GPS satellite time (the reliable case)"
-                 if method == "gps_median"
-                 else "the drive's own name, because there were too few usable GPS readings")
-        add(f"- `{method}` -- {label}: **{n}**")
+        add(f"- `{method}` -- {labels.get(method, method)}: **{n}**")
     add("")
     add(f"Of the sessions decided by GPS, **{s['gps_median_within_2_min_of_filename']}** "
         "agree with the camera's own clock to within two minutes, which is the "
@@ -924,8 +939,10 @@ def render_markdown(report: dict[str, Any]) -> str:
     add("| Vehicle | Sessions | New identifier | Moved over 2 min | GPS time | Name time | Needs review | No GPS rows |")
     add("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
     for v, d in sorted(s["per_vehicle"].items()):
+        gnss = d.get("gnss_median", 0) + d.get("gnss_median_clock_mismatch", 0)
+        named = d.get("filename_low", 0) + d.get("filename_estimated_clock_offset", 0)
         add(f"| {v} | {d['sessions']} | {d['new_id']} | {d['retimed_over_2_min']} | "
-            f"{d['gps_median']} | {d['filename_low']} | {d['needs_review']} | {d['no_gnss']} |")
+            f"{gnss} | {named} | {d['needs_review']} | {d['no_gnss']} |")
     add("")
 
     add("## Things a person needs to look at")

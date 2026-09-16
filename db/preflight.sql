@@ -18,6 +18,10 @@ WITH req(name, kind) AS (
     ('dashcam.derived_event','table'),
     ('dashcam.storyboard_frame','table'),
 
+    -- import tracking (what arrived, and what became of each drive in it)
+    ('dashcam.import_batch','table'),
+    ('dashcam.import_item','table'),
+
     -- views required by derived refresh
     ('dashcam.v_gnss_valid','view'),
     ('dashcam.v_accel_5hz','view')
