@@ -26,7 +26,13 @@ SCHEMA_VERSION = 1
 
 #: A clip's life: copied off the card, moved to the holding folder, deleted by
 #: the holding window, or found to disagree with a clip we already had.
-CLIP_STATES = ("staged", "held", "purged", "conflict")
+#:
+#: "archived" is the odd one out: it is a note that a clip was already processed
+#: before this pipeline existed, so its video lives wherever it was put at the
+#: time rather than in the holding folder. Nothing here holds it, and nothing
+#: here will delete it -- it exists so that a card which was never erased is not
+#: copied all over again.
+CLIP_STATES = ("staged", "held", "purged", "conflict", "archived")
 
 #: A drive's life. The last four are outcomes, not failures to retry.
 DRIVE_STATES = (
@@ -224,6 +230,43 @@ class Ledger:
         self.conn.execute(
             f"UPDATE clip SET {', '.join(sets)} WHERE vehicle_tag = ? AND stem = ?;", values
         )
+
+    def record_archived_clips(self, vehicle_tag: str, stems: Iterable[str]) -> int:
+        """Note clips that were already processed before this pipeline existed.
+
+        Their video is not in the holding folder: it lives wherever it was put
+        when the drive was made. There is nothing here to keep or delete. What
+        matters is that the pipeline knows it has seen them, because otherwise
+        inserting a card that was never erased copies hundreds of gigabytes of
+        footage that is already in the database, only to conclude there is
+        nothing to do.
+
+        The size is recorded as nothing and the acquired time left empty, both
+        of which are true: we never copied these. Anything already recorded is
+        left exactly as it is, so a clip whose video we really are holding is
+        never downgraded to a note.
+        """
+        rows = []
+        for stem in stems:
+            s = str(stem)
+            tail = s.split("_")[-1]
+            rows.append((
+                vehicle_tag, s, s[:15],
+                "rear" if tail.upper().endswith("R") else "front",
+                (tail[:-1].upper() or None), 0, "archived",
+            ))
+        if not rows:
+            return 0
+
+        before = self.conn.total_changes
+        self.conn.executemany(
+            "INSERT INTO clip "
+            "  (vehicle_tag, stem, ts_key, channel, clip_type, size_bytes, state, acquired_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL) "
+            "ON CONFLICT(vehicle_tag, stem) DO NOTHING;",
+            rows,
+        )
+        return self.conn.total_changes - before
 
     def clips_in_state(self, state: str, vehicle_tag: Optional[str] = None) -> list[sqlite3.Row]:
         if vehicle_tag:

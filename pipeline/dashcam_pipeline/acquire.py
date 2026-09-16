@@ -64,8 +64,11 @@ def _already_have(ledger: Ledger, vehicle_tag: str, clip: ClipRef) -> bool:
     row = ledger.get_clip(vehicle_tag, clip.stem)
     if row is None:
         return False
-    if row["state"] == "purged":
-        return True  # deliberately deleted by the holding window; do not fetch again
+    if row["state"] in ("purged", "archived"):
+        # Purged: deliberately deleted by the holding window. Archived: already
+        # processed before this pipeline existed, its video kept elsewhere.
+        # Either way it is accounted for and must not be fetched again.
+        return True
     for column in ("staged_path", "held_path"):
         value = row[column]
         if value and Path(value).is_file():

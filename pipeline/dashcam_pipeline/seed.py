@@ -98,7 +98,7 @@ def seed_from_folders(
     if roots is None:
         roots = [v.output_root / v.tag for v in cfg.vehicles]
 
-    drives = clips = 0
+    drives = clips = noted = 0
     skipped: list[str] = []
 
     for root in roots:
@@ -159,9 +159,16 @@ def seed_from_folders(
             if stems:
                 ledger.set_drive_clips(vehicle, tag, stems)
                 clips += len(stems)
+                # Also note each clip itself, so a card that was never erased is
+                # recognised clip by clip and not copied all over again. Without
+                # this the planner knows the drive is done, but only after the
+                # whole card has been copied to find that out.
+                noted += ledger.record_archived_clips(vehicle, stems)
             drives += 1
 
     log(f"recorded {drives} drive folder(s) on this PC, covering {clips} clip(s)")
+    if noted:
+        log(f"noted {noted} clip(s) as already processed, so they are never copied again")
     if skipped:
         log(f"{len(skipped)} folder(s) had no usable manifest and were left alone")
     return drives, clips, skipped

@@ -444,6 +444,75 @@ class InterruptedBuildTests(unittest.TestCase):
         self.assertEqual(sorted(plans[0].stems), sorted(grown))
 
 
+class AlreadyProcessedTests(unittest.TestCase):
+    """A card that was never erased must not be copied all over again.
+
+    The planner knows which drives are already done, but it only finds that out
+    after the whole card has been copied. Noting the clips themselves is what
+    stops a 238 GB card being copied in full to reach the conclusion that there
+    is nothing to do.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
+        self.addCleanup(self.led.close)
+
+    def _would_copy(self, stem: str, vehicle: str = "civic") -> bool:
+        from types import SimpleNamespace
+
+        from dashcam_pipeline.acquire import _already_have
+
+        return not _already_have(self.led, vehicle, SimpleNamespace(stem=stem))
+
+    def test_a_clip_from_a_drive_already_loaded_is_not_copied_again(self):
+        self.led.record_archived_clips("civic", ["20260721_131853_EF", "20260721_131853_ER"])
+
+        self.assertFalse(self._would_copy("20260721_131853_EF"))
+        self.assertFalse(self._would_copy("20260721_131853_ER"))
+
+    def test_a_clip_never_seen_before_is_still_copied(self):
+        self.led.record_archived_clips("civic", ["20260721_131853_EF"])
+
+        self.assertTrue(self._would_copy("20260810_210322_IF"),
+                        "genuinely new footage must still come off the card")
+
+    def test_video_we_are_really_holding_is_not_downgraded_to_a_note(self):
+        self.led.record_clip(
+            vehicle_tag="civic", stem="20260721_131853_EF", ts_key="20260721_131853",
+            channel="front", clip_type="E", size_bytes=1234, state="held",
+            held_path="F:/Dashcam/Holding/civic/20260721/20260721_131853_EF.mp4",
+        )
+
+        added = self.led.record_archived_clips("civic", ["20260721_131853_EF"])
+
+        row = self.led.get_clip("civic", "20260721_131853_EF")
+        self.assertEqual(added, 0)
+        self.assertEqual(row["state"], "held", "we are holding this video; it is not a note")
+        self.assertEqual(row["size_bytes"], 1234)
+
+    def test_a_note_records_what_it_honestly_knows(self):
+        self.led.record_archived_clips("civic", ["20260721_131853_ER"])
+
+        row = self.led.get_clip("civic", "20260721_131853_ER")
+        self.assertEqual(row["channel"], "rear")
+        self.assertEqual(row["clip_type"], "E")
+        self.assertIsNone(row["acquired_at"], "we never copied it, so there is no time to record")
+
+    def test_a_note_is_not_video_the_holding_window_can_delete(self):
+        self.led.record_archived_clips("civic", ["20260721_131853_EF"])
+
+        self.assertEqual(self.led.clips_in_state("held"), [],
+                         "there is no video here to delete")
+
+    def test_the_other_car_is_unaffected(self):
+        self.led.record_archived_clips("civic", ["20260806_082808_NF"])
+
+        self.assertTrue(self._would_copy("20260806_082808_NF", vehicle="camry"),
+                        "the same filename on the other car's card is different footage")
+
+
 class SupersededParcelTests(unittest.TestCase):
     """Parcels made up while the server was away must not pile up.
 
