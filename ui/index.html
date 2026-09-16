@@ -18,6 +18,11 @@
     header { padding:12px 16px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
     header .title { font-weight:650; }
     header .muted { color:var(--muted); font-size:12px; }
+    header .nav { display:flex; gap:6px; align-items:center; font-size:12px; }
+    header .nav a { color:var(--muted); text-decoration:none; padding:2px 8px; border-radius:8px; }
+    header .nav a:hover { color:var(--text); }
+    header .nav a.current { color:var(--text); background:rgba(255,255,255,0.06); }
+    header .nav .sep { color:var(--border); }
     select, button, input[type="range"] { font:inherit; }
     select, button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:8px 10px; }
     button { cursor:pointer; }
@@ -142,6 +147,11 @@
 <body>
   <header>
     <div class="title">Dashcam Viewer <span class="pill">v0.4</span></div>
+    <nav class="nav">
+      <a href="index.html" class="current" aria-current="page">Viewer</a>
+      <span class="sep">|</span>
+      <a href="imports.html">Imports</a>
+    </nav>
     <div class="muted" id="apiBase"></div>
   </header>
 
@@ -640,12 +650,21 @@
     if (chartInitialized) await renderChartShapes();
   }
 
+  // A start time that was not measured from satellites is worth flagging, quietly.
+  function approxTimeBadge(tc) {
+    if (!tc || !String(tc).startsWith("filename")) return "";
+    const why = tc === "filename_estimated_clock_offset"
+      ? "Camera clock, corrected using nearby drives"
+      : "Camera clock — too few satellite fixes to measure the time";
+    return ` <span class="badge" title="${escapeHtml(why)} (${escapeHtml(tc)})">approximate time</span>`;
+  }
+
   function setSessionMeta(s) {
     const sync = s.time_sync || {};
     elSessionMeta.innerHTML = `
       <div><b>Session:</b> <span class="small">${s.drive_session_id}</span></div>
       <div><b>Vehicle:</b> <span class="small">${s.vehicle_tag || "—"}</span></div>
-      <div><b>Start:</b> <span class="small">${s.start_ts_utc || "—"}</span></div>
+      <div><b>Start:</b> <span class="small">${s.start_ts_utc || "—"}</span>${approxTimeBadge(s.time_confidence)}</div>
       <div><b>End:</b> <span class="small">${s.end_ts_utc || "—"}</span></div>
       <div><b>time_sync:</b> <span class="small">slope=${(sync.slope ?? "—")} p95_ms=${(sync.residual_p95_ms ?? "—")}</span></div>
     `;
@@ -1078,7 +1097,21 @@
 
   elScrub.addEventListener("input", onScrubInput);
 
-  loadSessions().catch(err => alert(err.message));
+  // ?session=<uuid> loads that drive straight away instead of waiting for a click.
+  const initialSession = new URLSearchParams(location.search).get("session");
+
+  loadSessions()
+    .then(() => {
+      if (!initialSession) return;
+      const tr = elSessionTableBody.querySelector(`tr[data-sid="${CSS.escape(initialSession)}"]`);
+      if (tr) {
+        elSessionTableBody.querySelectorAll("tr.active").forEach(r => r.classList.remove("active"));
+        tr.classList.add("active");
+        tr.scrollIntoView({ block: "nearest" });
+      }
+      return loadSession(initialSession);
+    })
+    .catch(err => alert(err.message));
 })();
 </script>
 </body>

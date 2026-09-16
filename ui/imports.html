@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Imports — Dashcam</title>
+
+  <style>
+    :root { --bg:#0b0f14; --panel:#111823; --text:#e6edf3; --muted:#9fb0c0; --border:#253244; --danger:#ff6b6b; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+    header { padding:12px 16px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
+    header .title { font-weight:650; }
+    header .muted { color:var(--muted); font-size:12px; }
+    header .nav { display:flex; gap:6px; align-items:center; font-size:12px; }
+    header .nav a { color:var(--muted); text-decoration:none; padding:2px 8px; border-radius:8px; }
+    header .nav a:hover { color:var(--text); }
+    header .nav a.current { color:var(--text); background:rgba(255,255,255,0.06); }
+    header .nav .sep { color:var(--border); }
+
+    .wrap { padding:12px; box-sizing:border-box; max-width:1100px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:12px; box-sizing:border-box; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .kv { font-size:12px; color:var(--muted); line-height:1.45; }
+    .kv b { color:var(--text); font-weight:600; }
+    .small { font-size:12px; color:var(--muted); }
+    .pill { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:12px; }
+    .badge { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; font-size:11px; color:var(--muted); }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    /* Same table language as the session browser in index.html */
+    .session-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .session-table th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); }
+    .session-table td { padding:7px 8px; border-bottom:1px solid var(--border); white-space:nowrap; vertical-align:top; }
+    .session-table tr.batch { cursor:pointer; }
+    .session-table tbody tr.batch:hover { background:rgba(255,255,255,0.04); }
+    .session-table tbody tr.batch.open { background:rgba(100,180,255,0.12); }
+
+    .caret { display:inline-block; width:10px; color:var(--muted); transition:transform .12s ease; }
+    tr.batch.open .caret { transform:rotate(90deg); color:var(--text); }
+
+    .detail > td { padding:0 8px 12px 8px; border-bottom:1px solid var(--border); background:rgba(0,0,0,0.12); white-space:normal; }
+    .drives { width:100%; border-collapse:collapse; font-size:12px; margin-top:4px; }
+    .drives th { color:var(--muted); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); }
+    .drives td { padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+    .drives tr:last-child td { border-bottom:none; }
+    .drives a { color:#4dabf7; text-decoration:none; }
+    .drives a:hover { text-decoration:underline; }
+    .reason { color:var(--text); }
+    .counts { color:var(--muted); font-size:11px; }
+    .code { font-size:10px; opacity:.75; }
+    .empty { padding:18px 8px; color:var(--muted); font-size:13px; }
+    .err { color:var(--danger); font-size:12px; }
+    .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+    .filters label { font-size:11px; color:var(--muted); }
+    select { font:inherit; font-size:12px; padding:5px 8px; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:10px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">Imports <span class="pill">v0.4</span></div>
+    <nav class="nav">
+      <a href="index.html">Viewer</a>
+      <span class="sep">|</span>
+      <a href="imports.html" class="current" aria-current="page">Imports</a>
+    </nav>
+    <div class="muted" id="statusLine">Loading&hellip;</div>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <div class="filters">
+        <label>Vehicle
+          <select id="vehicleFilter"><option value="">All</option></select>
+        </label>
+        <label>Status
+          <select id="statusFilter">
+            <option value="">All</option>
+            <option value="completed">Done</option>
+            <option value="completed_with_errors">Done, with problems</option>
+            <option value="failed">Failed</option>
+            <option value="ingesting">Loading now</option>
+            <option value="retry_wait">Waiting to try again</option>
+            <option value="received">Just arrived</option>
+          </select>
+        </label>
+        <span class="small" id="refreshNote"></span>
+      </div>
+
+      <table class="session-table">
+        <thead>
+          <tr>
+            <th style="width:18px;"></th>
+            <th>Arrived</th>
+            <th>Vehicle</th>
+            <th>From</th>
+            <th>New clips</th>
+            <th>GB</th>
+            <th>What happened</th>
+          </tr>
+        </thead>
+        <tbody id="batchBody"></tbody>
+      </table>
+
+      <div class="empty" id="emptyNote" style="display:none;">No imports recorded yet.</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const API = `/api`;
+  const REFRESH_MS = 15000;
+  const IN_PROGRESS = new Set(["received", "ingesting", "retry_wait"]);
+
+  const elBatchBody = document.getElementById("batchBody");
+  const elEmptyNote = document.getElementById("emptyNote");
+  const elStatusLine = document.getElementById("statusLine");
+  const elRefreshNote = document.getElementById("refreshNote");
+  const elVehicleFilter = document.getElementById("vehicleFilter");
+  const elStatusFilter = document.getElementById("statusFilter");
+
+  let batches = [];
+  const expanded = new Set();     // batch_id values whose drives are showing
+  const details = new Map();      // batch_id -> detail payload (or null while loading)
+  let refreshTimer = null;
+  let loading = false;
+
+  async function apiGet(path) {
+    const r = await fetch(API + path);
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${path}`);
+    return await r.json();
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  // Same shape as fmtDate in index.html: local (America/Chicago) "Apr 16 1:18p"
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    const mon = d.toLocaleString("en-US", { month: "short", timeZone: "America/Chicago" });
+    const day = d.toLocaleString("en-US", { day: "numeric", timeZone: "America/Chicago" });
+    let hr = d.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
+    hr = hr.replace(/ AM/, "a").replace(/ PM/, "p");
+    return `${mon} ${day} ${hr}`;
+  }
+
+  // Fallback when a drive never became a session: the time in its folder name.
+  // That is camera wall-clock, so it is formatted straight from the digits with
+  // no timezone conversion.
+  const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  function fmtTagTime(tag) {
+    const m = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/.exec(String(tag || ""));
+    if (!m) return null;
+    const mon = MON[Number(m[2]) - 1] || m[2];
+    let h = Number(m[4]);
+    const ap = h >= 12 ? "p" : "a";
+    h = h % 12; if (h === 0) h = 12;
+    return `${mon} ${Number(m[3])} ${h}:${m[5]}${ap}`;
+  }
+
+  function fmtGB(bytes) {
+    if (bytes == null) return "—";
+    const gb = Number(bytes) / (1024 ** 3);
+    if (!Number.isFinite(gb)) return "—";
+    return gb >= 10 ? gb.toFixed(0) : gb.toFixed(1);
+  }
+
+  const BATCH_STATUS = {
+    received:              { label: "Just arrived",          color: "#9fb0c0" },
+    ingesting:             { label: "Loading now",           color: "#4dabf7" },
+    retry_wait:            { label: "Waiting to try again",  color: "#ffa94d" },
+    completed:             { label: "Done",                  color: "#69db7c" },
+    completed_with_errors: { label: "Done, with problems",   color: "#ffd166" },
+    failed:                { label: "Failed",                color: "#ff6b6b" },
+  };
+
+  const ITEM_STATUS = {
+    ingested:          { label: "Loaded",                  color: "#69db7c" },
+    skipped_short:     { label: "Too short to keep",       color: "#9fb0c0" },
+    parking_only:      { label: "Parked, not a drive",     color: "#9fb0c0" },
+    quarantined:       { label: "Set aside for a look",    color: "#ffd166" },
+    failed_processing: { label: "Couldn't be processed",   color: "#ff6b6b" },
+    failed:            { label: "Failed",                  color: "#ff6b6b" },
+    needs_review:      { label: "Needs a look",            color: "#ffd166" },
+    superseded:        { label: "Replaced by a newer copy", color: "#9fb0c0" },
+  };
+
+  const SOURCE_KIND = {
+    sdcard: "SD card",
+    folder: "Folder",
+    wifi:   "Wi-Fi",
+    legacy: "Older import",
+  };
+
+  function statusPill(map, status) {
+    const known = map[status];
+    const label = known ? known.label : (status || "—");
+    const color = known ? known.color : "#9fb0c0";
+    return `<span class="badge" style="border-color:${color}; color:${color};" title="${escapeHtml(status || "")}">${escapeHtml(label)}</span>`;
+  }
+
+  // A start time we did not measure from satellites is worth flagging, quietly.
+  function approxTimeBadge(tc) {
+    if (!tc || !String(tc).startsWith("filename")) return "";
+    const why = tc === "filename_estimated_clock_offset"
+      ? "Camera clock, corrected using nearby drives"
+      : "Camera clock — too few satellite fixes to measure the time";
+    return ` <span class="badge" title="${escapeHtml(why)} (${escapeHtml(tc)})">approximate time</span>`;
+  }
+
+  function fmtCounts(counts) {
+    if (!counts || typeof counts !== "object" || Array.isArray(counts)) return "";
+    const parts = Object.entries(counts)
+      .filter(([, v]) => v != null)
+      .map(([k, v]) => `${escapeHtml(k.replaceAll("_", " "))} ${escapeHtml(v)}`);
+    return parts.length ? `<div class="counts">${parts.join(" &middot; ")}</div>` : "";
+  }
+
+  function renderDrives(detail) {
+    if (detail === null) return `<div class="small">Loading drives&hellip;</div>`;
+    if (detail && detail.__error) {
+      return `<div class="err">Couldn't load the drives for this import: ${escapeHtml(detail.__error)}</div>`;
+    }
+
+    const items = (detail && detail.items) || [];
+    const batchError = detail && detail.error
+      ? `<div class="err" style="margin:8px 0 4px 0;">${escapeHtml(detail.error)}</div>` : "";
+
+    if (!items.length) {
+      return `${batchError}<div class="small" style="padding:8px 0;">No drives were recorded for this import.</div>`;
+    }
+
+    const rows = items.map(it => {
+      const when = it.session_start_ts_utc
+        ? fmtDate(it.session_start_ts_utc)
+        : (fmtTagTime(it.drive_tag) || "—");
+      const fromName = !it.session_start_ts_utc && fmtTagTime(it.drive_tag)
+        ? ` <span class="badge" title="No drive was loaded, so this is the time in the folder name">from the folder name</span>`
+        : "";
+
+      const reason = it.reason
+        ? `<div class="reason">${escapeHtml(it.reason)}</div>`
+        : (it.reason_code ? `<div class="reason">${escapeHtml(String(it.reason_code).replaceAll("_", " ").toLowerCase())}</div>` : `<span class="small">—</span>`);
+      const code = it.reason_code
+        ? `<div class="small mono code">${escapeHtml(it.reason_code)}</div>` : "";
+
+      const link = it.drive_session_id
+        ? `<a href="index.html?session=${encodeURIComponent(it.drive_session_id)}">open in viewer</a>`
+        : `<span class="small">—</span>`;
+
+      return `
+        <tr>
+          <td class="mono">${escapeHtml(it.drive_tag || "—")}${it.view && it.view !== "front" ? ` <span class="badge">${escapeHtml(it.view)}</span>` : ""}</td>
+          <td>${escapeHtml(when)}${approxTimeBadge(it.time_confidence)}${fromName}</td>
+          <td>${it.clip_pairs == null ? "—" : escapeHtml(it.clip_pairs)}</td>
+          <td>${statusPill(ITEM_STATUS, it.status)}</td>
+          <td>${reason}${code}${fmtCounts(it.counts)}</td>
+          <td>${link}</td>
+        </tr>`;
+    }).join("");
+
+    return `${batchError}
+      <table class="drives">
+        <thead>
+          <tr><th>Drive</th><th>Started</th><th>Clip pairs</th><th>Outcome</th><th>Why / what was loaded</th><th></th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function render() {
+    if (!batches.length) {
+      elBatchBody.innerHTML = "";
+      elEmptyNote.style.display = "block";
+      return;
+    }
+    elEmptyNote.style.display = "none";
+
+    elBatchBody.innerHTML = batches.map(b => {
+      const id = b.batch_id;
+      const open = expanded.has(id);
+      const items = Number(b.item_count || 0);
+      const bad = Number(b.not_ingested_count || 0);
+
+      const drivesNote = items
+        ? `<div class="small">${items} drive${items === 1 ? "" : "s"}${bad ? ` &middot; ${bad} not loaded` : ""}</div>`
+        : `<div class="small">no drives recorded</div>`;
+
+      const onSource = (b.clips_on_source != null && b.clips_new != null && b.clips_on_source !== b.clips_new)
+        ? ` <span class="small">of ${escapeHtml(b.clips_on_source)}</span>` : "";
+
+      const detailRow = open
+        ? `<tr class="detail" data-detail="${escapeHtml(id)}"><td colspan="7">${renderDrives(details.has(id) ? details.get(id) : null)}</td></tr>`
+        : "";
+
+      return `
+        <tr class="batch${open ? " open" : ""}" data-bid="${escapeHtml(id)}">
+          <td><span class="caret">&#9656;</span></td>
+          <td>${escapeHtml(fmtDate(b.received_at))}</td>
+          <td>${escapeHtml(b.vehicle_tag || "—")}</td>
+          <td>${escapeHtml(SOURCE_KIND[b.source_kind] || b.source_kind || "—")}</td>
+          <td>${b.clips_new == null ? "—" : escapeHtml(b.clips_new)}${onSource}</td>
+          <td>${escapeHtml(fmtGB(b.bytes_new))}</td>
+          <td>${statusPill(BATCH_STATUS, b.status)}${drivesNote}</td>
+        </tr>
+        ${detailRow}`;
+    }).join("");
+  }
+
+  function anyInProgress() {
+    return batches.some(b => IN_PROGRESS.has(b.status));
+  }
+
+  function scheduleRefresh() {
+    if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+    if (!anyInProgress()) {
+      elRefreshNote.textContent = "";
+      return;
+    }
+    elRefreshNote.textContent = "an import is still running — this page updates every 15 seconds";
+    refreshTimer = setTimeout(() => { load().catch(() => {}); }, REFRESH_MS);
+  }
+
+  async function loadDetail(batchId) {
+    try {
+      const d = await apiGet(`/imports/${encodeURIComponent(batchId)}`);
+      details.set(batchId, d);
+    } catch (e) {
+      details.set(batchId, { __error: e.message });
+    }
+    // Only repaint the one expanded block, so a refresh does not fight a click.
+    const cell = elBatchBody.querySelector(`tr.detail[data-detail="${CSS.escape(batchId)}"] > td`);
+    if (cell) cell.innerHTML = renderDrives(details.get(batchId));
+  }
+
+  async function load() {
+    if (loading) return;
+    loading = true;
+    try {
+      const params = new URLSearchParams();
+      if (elVehicleFilter.value) params.set("vehicle", elVehicleFilter.value);
+      if (elStatusFilter.value) params.set("status", elStatusFilter.value);
+      params.set("limit", "100");
+      batches = await apiGet("/imports?" + params.toString());
+
+      // Forget any expansion whose batch is no longer on screen.
+      const present = new Set(batches.map(b => b.batch_id));
+      for (const id of [...expanded]) if (!present.has(id)) { expanded.delete(id); details.delete(id); }
+
+      render();
+      elStatusLine.textContent = batches.length
+        ? `${batches.length} import${batches.length === 1 ? "" : "s"}`
+        : "nothing imported yet";
+
+      await Promise.all([...expanded].map(id => loadDetail(id)));
+      scheduleRefresh();
+    } catch (e) {
+      elStatusLine.innerHTML = `<span class="err">Couldn't reach the server: ${escapeHtml(e.message)}</span>`;
+      if (!batches.length) {
+        elBatchBody.innerHTML = "";
+        elEmptyNote.style.display = "none";
+      }
+      scheduleRefresh();
+    } finally {
+      loading = false;
+    }
+  }
+
+  function toggle(batchId) {
+    if (expanded.has(batchId)) {
+      expanded.delete(batchId);
+      render();
+      return;
+    }
+    expanded.add(batchId);
+    render();
+    if (!details.has(batchId)) loadDetail(batchId);
+    else {
+      const cell = elBatchBody.querySelector(`tr.detail[data-detail="${CSS.escape(batchId)}"] > td`);
+      if (cell) cell.innerHTML = renderDrives(details.get(batchId));
+    }
+  }
+
+  elBatchBody.addEventListener("click", (e) => {
+    if (e.target.closest("a")) return;             // let the viewer links through
+    const tr = e.target.closest("tr.batch[data-bid]");
+    if (!tr) return;
+    toggle(tr.dataset.bid);
+  });
+
+  elVehicleFilter.addEventListener("change", () => load().catch(() => {}));
+  elStatusFilter.addEventListener("change", () => load().catch(() => {}));
+
+  async function loadVehicles() {
+    try {
+      const vehicles = await apiGet("/vehicles");
+      elVehicleFilter.innerHTML = `<option value="">All</option>` +
+        vehicles.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join("");
+    } catch (e) { /* keep default "All" */ }
+  }
+
+  const wanted = new URLSearchParams(location.search).get("batch");
+  if (wanted) expanded.add(wanted);
+
+  loadVehicles();
+  load().catch(() => {});
+})();
+</script>
+</body>
+</html>

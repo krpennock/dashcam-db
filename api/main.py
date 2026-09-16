@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 from datetime import datetime
 from typing import Optional, List
 
@@ -117,6 +118,7 @@ async def list_sessions(
     before_ts = _parse_ts(before)
     q = """
     SELECT d.drive_session_id::text, d.vehicle_tag, d.start_ts_utc, d.end_ts_utc,
+           d.drive_tag, d.time_confidence,
            s.duration_s, s.distance_mi, s.max_speed_mph, s.avg_speed_mph
     FROM dashcam.drive_session d
     LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
@@ -135,7 +137,8 @@ async def list_sessions(
 @app.get("/sessions/{session_id}")
 async def get_session(session_id: str):
     q = """
-    SELECT drive_session_id::text, vehicle_tag, start_ts_utc, end_ts_utc, notes, time_sync
+    SELECT drive_session_id::text, vehicle_tag, start_ts_utc, end_ts_utc, notes, time_sync,
+           drive_tag, time_confidence
     FROM dashcam.drive_session
     WHERE drive_session_id = $1::uuid;
     """
@@ -391,3 +394,118 @@ async def nearest(session_id: str, ts: str):
         "accel": dict(accel) if accel else None,
         "clip": dict(clip) if clip else None,
     }
+
+
+@app.get("/imports")
+async def list_imports(
+    limit: int = Query(100, ge=1, le=1000),
+    vehicle: Optional[str] = None,
+    status: Optional[str] = None,
+):
+    q = """
+    SELECT b.batch_id::text, b.source_kind, b.source_key, b.vehicle_tag,
+           b.camera_serial, b.camera_model, b.camera_firmware,
+           b.clips_on_source, b.clips_new, b.bytes_new,
+           b.detected_at, b.acquired_at, b.processed_at, b.received_at, b.completed_at,
+           b.status, b.attempts, b.error,
+           COALESCE(i.item_count, 0)         AS item_count,
+           COALESCE(i.not_ingested_count, 0) AS not_ingested_count
+    FROM dashcam.import_batch b
+    LEFT JOIN (
+      SELECT batch_id,
+             count(*)                                    AS item_count,
+             count(*) FILTER (WHERE status <> 'ingested') AS not_ingested_count
+      FROM dashcam.import_item
+      GROUP BY batch_id
+    ) i ON i.batch_id = b.batch_id
+    WHERE ($1::text IS NULL OR b.vehicle_tag = $1)
+      AND ($2::text IS NULL OR b.status = $2)
+    ORDER BY b.received_at DESC
+    LIMIT $3;
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, vehicle, status, limit)
+    return [dict(r) for r in rows]
+
+
+# Declared before /imports/{batch_id} so "items" is not read as a batch id.
+@app.get("/imports/items")
+async def list_import_items(
+    limit: int = Query(200, ge=1, le=2000),
+    vehicle: Optional[str] = None,
+    status: Optional[str] = None,
+):
+    q = """
+    SELECT i.item_id, i.batch_id::text, i.vehicle_tag, i.drive_tag, i.view,
+           i.drive_session_id::text, i.clip_pairs, i.first_clip, i.last_clip,
+           i.status, i.reason_code, i.reason, i.counts, i.time_confidence,
+           i.created_at, i.started_at, i.finished_at,
+           ds.start_ts_utc AS session_start_ts_utc,
+           b.received_at, b.source_kind, b.status AS batch_status
+    FROM dashcam.import_item i
+    JOIN dashcam.import_batch b ON b.batch_id = i.batch_id
+    LEFT JOIN dashcam.drive_session ds ON ds.drive_session_id = i.drive_session_id
+    WHERE ($1::text IS NULL OR i.status = $1)
+      AND ($2::text IS NULL OR i.vehicle_tag = $2)
+    ORDER BY i.created_at DESC, i.item_id DESC
+    LIMIT $3;
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, status, vehicle, limit)
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["counts"] = _coerce_json(d.get("counts"))
+        out.append(d)
+    return out
+
+
+@app.get("/imports/{batch_id}")
+async def get_import(batch_id: str):
+    try:
+        uuid.UUID(batch_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Import not found")
+
+    q_batch = """
+    SELECT batch_id::text, source_kind, source_key, vehicle_tag,
+           camera_serial, camera_model, camera_firmware,
+           clips_on_source, clips_new, bytes_new,
+           detected_at, acquired_at, processed_at, received_at, completed_at,
+           status, attempts, error, pc_summary
+    FROM dashcam.import_batch
+    WHERE batch_id = $1::uuid;
+    """
+
+    q_items = """
+    SELECT i.item_id, i.batch_id::text, i.vehicle_tag, i.drive_tag, i.view,
+           i.drive_session_id::text, i.clip_pairs, i.first_clip, i.last_clip,
+           i.status, i.reason_code, i.reason, i.counts, i.time_confidence,
+           i.created_at, i.started_at, i.finished_at,
+           ds.start_ts_utc AS session_start_ts_utc
+    FROM dashcam.import_item i
+    LEFT JOIN dashcam.drive_session ds ON ds.drive_session_id = i.drive_session_id
+    WHERE i.batch_id = $1::uuid
+    ORDER BY i.drive_tag, i.view;
+    """
+
+    assert pool is not None
+    async with pool.acquire() as con:
+        row = await con.fetchrow(q_batch, batch_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Import not found")
+        items = await con.fetch(q_items, batch_id)
+
+    data = dict(row)
+    data["pc_summary"] = _coerce_json(data.get("pc_summary"))
+
+    out_items = []
+    for r in items:
+        d = dict(r)
+        d["counts"] = _coerce_json(d.get("counts"))
+        out_items.append(d)
+    data["items"] = out_items
+    return data
