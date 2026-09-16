@@ -408,13 +408,25 @@ async def list_imports(
            b.clips_on_source, b.clips_new, b.bytes_new,
            b.detected_at, b.acquired_at, b.processed_at, b.received_at, b.completed_at,
            b.status, b.attempts, b.error,
-           COALESCE(i.item_count, 0)         AS item_count,
-           COALESCE(i.not_ingested_count, 0) AS not_ingested_count
+           COALESCE(i.item_count, 0)     AS item_count,
+           COALESCE(i.recorded_count, 0) AS recorded_count,
+           COALESCE(i.problem_count, 0)  AS problem_count
     FROM dashcam.import_batch b
     LEFT JOIN (
       SELECT batch_id,
-             count(*)                                    AS item_count,
-             count(*) FILTER (WHERE status <> 'ingested') AS not_ingested_count
+             count(*) AS item_count,
+             -- Deliberately not loaded, and no cause for concern: a recording
+             -- too short to be a drive, one made while parked, or one replaced
+             -- by a better copy. Counting these as "not loaded" made a clean
+             -- import look like a partial failure.
+             count(*) FILTER (
+               WHERE status IN ('skipped_short', 'parking_only', 'superseded')
+             ) AS recorded_count,
+             -- Everything else that did not load: these genuinely want a look.
+             count(*) FILTER (
+               WHERE status NOT IN
+                 ('ingested', 'skipped_short', 'parking_only', 'superseded')
+             ) AS problem_count
       FROM dashcam.import_item
       GROUP BY batch_id
     ) i ON i.batch_id = b.batch_id

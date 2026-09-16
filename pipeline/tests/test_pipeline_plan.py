@@ -444,6 +444,65 @@ class InterruptedBuildTests(unittest.TestCase):
         self.assertEqual(sorted(plans[0].stems), sorted(grown))
 
 
+class ImportMessageTests(unittest.TestCase):
+    """What the phone is told when a delivery finishes.
+
+    A recording too short to be a drive, or one made while parked, is noted and
+    deliberately not loaded. Counting only loads and failures announced a
+    perfectly good delivery as "0 drives loaded", which reads like a failure.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
+        self.addCleanup(self.led.close)
+
+    def _message(self):
+        rows = self.led.pending_messages(limit=5)
+        self.assertTrue(rows, "a message should have been queued")
+        return rows[-1]
+
+    def test_nothing_needing_to_load_does_not_read_as_a_failure(self):
+        from dashcam_pipeline import notify
+
+        notify.import_done(self.led, "civic", 0, 0, "b1", recorded=7)
+
+        m = self._message()
+        self.assertNotIn("0 drive", m["message"])
+        self.assertIn("nothing needed loading", m["title"])
+        self.assertIn("7 recordings", m["message"])
+        self.assertEqual(m["priority"], "default", "nothing went wrong, so do not shout")
+
+    def test_what_loaded_and_what_was_merely_noted_are_both_counted(self):
+        from dashcam_pipeline import notify
+
+        notify.import_done(self.led, "civic", 3, 0, "b1", recorded=2)
+
+        m = self._message()
+        self.assertIn("3 drives loaded", m["message"])
+        self.assertIn("2 noted but not loaded", m["message"])
+
+    def test_a_real_failure_still_says_so_plainly(self):
+        from dashcam_pipeline import notify
+
+        notify.import_done(self.led, "civic", 1, 2, "b1")
+
+        m = self._message()
+        self.assertIn("problems", m["title"])
+        self.assertIn("2 did not load", m["message"])
+        self.assertEqual(m["priority"], "high")
+
+    def test_something_wanting_a_look_is_raised_even_when_all_loaded(self):
+        from dashcam_pipeline import notify
+
+        notify.import_done(self.led, "civic", 4, 0, "b1", for_review=1)
+
+        m = self._message()
+        self.assertIn("1 set aside for a look", m["message"])
+        self.assertEqual(m["priority"], "high", "a drive wanting a look must not be silent")
+
+
 class AlreadyProcessedTests(unittest.TestCase):
     """A card that was never erased must not be copied all over again.
 

@@ -287,10 +287,19 @@
       const id = b.batch_id;
       const open = expanded.has(id);
       const items = Number(b.item_count || 0);
-      const bad = Number(b.not_ingested_count || 0);
+      const noted = Number(b.recorded_count || 0);
+      const problems = Number(b.problem_count || 0);
+
+      // "N not loaded" used to include recordings that were never meant to load
+      // -- too short to be a drive, or parked -- so a perfectly good import read
+      // as a partial failure. Those are now shown as noted, and only genuine
+      // trouble is called out.
+      const notes = [];
+      if (noted) notes.push(`${noted} noted, not loaded`);
+      if (problems) notes.push(`${problems} need${problems === 1 ? "s" : ""} a look`);
 
       const drivesNote = items
-        ? `<div class="small">${items} drive${items === 1 ? "" : "s"}${bad ? ` &middot; ${bad} not loaded` : ""}</div>`
+        ? `<div class="small">${items} drive${items === 1 ? "" : "s"}${notes.length ? ` &middot; ${notes.join(" &middot; ")}` : ""}</div>`
         : `<div class="small">no drives recorded</div>`;
 
       const onSource = (b.clips_on_source != null && b.clips_new != null && b.clips_on_source !== b.clips_new)

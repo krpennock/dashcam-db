@@ -321,7 +321,11 @@ def confirm_deliveries(cfg: Config, ledger: Ledger, *, log: Callable[[str], None
             continue
 
         outcomes = delivery.outcome_by_drive(result)
-        loaded = failed = 0
+        # Counted apart: a drive that loaded, one that was deliberately not
+        # loaded (too short, or parked), one wanting a human look, and a real
+        # failure. Lumping the middle two in with failures is what made a
+        # perfectly good delivery announce itself as "0 drives loaded".
+        loaded = failed = recorded = for_review = 0
         for (drive_tag, view), item in outcomes.items():
             status = str(item.get("status"))
             mapped = {
@@ -337,13 +341,16 @@ def confirm_deliveries(cfg: Config, ledger: Ledger, *, log: Callable[[str], None
             )
             loaded += 1 if mapped == "ingested" else 0
             failed += 1 if mapped == "failed" else 0
+            recorded += 1 if mapped in ("skipped_short", "parking_only") else 0
+            for_review += 1 if mapped == "needs_review" else 0
 
         ledger.update_batch(batch["batch_id"], confirmed_at=utcnow(),
                             server_status=str(result.get("status")))
         notify.import_done(ledger, str(batch["vehicle_tag"]), loaded, failed,
-                           str(batch["batch_id"]), cfg.viewer_base)
+                           str(batch["batch_id"]), cfg.viewer_base,
+                           recorded=recorded, for_review=for_review)
         log(f"{batch['vehicle_tag']}: {batch['batch_id'][:8]} {result.get('status')} "
-            f"({loaded} loaded, {failed} not)")
+            f"({loaded} loaded, {recorded} recorded, {for_review} for review, {failed} failed)")
         confirmed += 1
     return confirmed
 

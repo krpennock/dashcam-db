@@ -172,16 +172,44 @@ def holding_full(ledger: Ledger, used_gb: float, cap_gb: float, free_gb: float) 
 
 
 def import_done(ledger: Ledger, vehicle: str, loaded: int, failed: int,
-                batch_id: str, viewer_base: str = "") -> None:
-    body = f"{loaded} drive{'s' if loaded != 1 else ''} loaded"
+                batch_id: str, viewer_base: str = "",
+                recorded: int = 0, for_review: int = 0) -> None:
+    """Say what became of a delivery, including what was never meant to load.
+
+    A recording too short to be a drive, or one made while parked, is noted but
+    deliberately not loaded. Counting only loads and failures produced the
+    message "0 drives loaded" when seven such recordings had been handled
+    perfectly well, which reads like a failure when nothing went wrong.
+    """
+    if loaded:
+        body = f"{loaded} drive{'s' if loaded != 1 else ''} loaded"
+        if recorded:
+            body += f", {recorded} noted but not loaded (too short, or parked)"
+    elif recorded:
+        body = (f"Nothing needed loading: {recorded} recording"
+                f"{'s' if recorded != 1 else ''} noted as too short to be a drive, or parked.")
+    else:
+        body = "Nothing to load"
+
     if failed:
-        body += f", {failed} did not load"
+        body += f"\n{failed} did not load"
+    if for_review:
+        body += f"\n{for_review} set aside for a look"
     if viewer_base:
         body += f"\n{viewer_base}/imports.html?batch={batch_id}"
+
+    if failed:
+        headline = "loaded with problems"
+    elif loaded:
+        headline = "loaded"
+    else:
+        headline = "nothing needed loading"
+
+    wants_attention = bool(failed or for_review)
     queue(
         ledger, IMPORT_DONE,
-        f"{vehicle}: {'loaded' if not failed else 'loaded with problems'}",
+        f"{vehicle}: {headline}",
         body,
-        tags="white_check_mark" if not failed else "warning",
-        priority="default" if not failed else "high",
+        tags="white_check_mark" if not wants_attention else "warning",
+        priority="default" if not wants_attention else "high",
     )
