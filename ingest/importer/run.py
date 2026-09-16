@@ -382,7 +382,14 @@ def process_batch(conn: psycopg.Connection, cfg: Config, batch_dir: Path) -> dic
     """Load every drive in one shipped batch and file its folders away."""
     batch = read_batch_file(batch_dir)
     if batch is None:
-        log(f"{batch_dir.name}: no usable batch.json, leaving it alone")
+        # Deliveries only become visible once the receiving script has verified
+        # them, so one without a readable batch.json is broken. Move it out of
+        # ready/ instead of finding it again on every pass for ever.
+        stash = cfg.failed / "_batches" / batch_dir.name
+        stash.parent.mkdir(parents=True, exist_ok=True)
+        move_aside(stash)
+        shutil.move(str(batch_dir), str(stash))
+        log(f"{batch_dir.name}: no usable batch.json; moved to {stash}")
         return {"skipped": True}
 
     batch_id = str(batch["batch_id"])
@@ -435,9 +442,19 @@ def process_batch(conn: psycopg.Connection, cfg: Config, batch_dir: Path) -> dic
         move_aside(dest)
         shutil.move(str(src), str(dest))
 
+    # The checksums were verified by the receiving script when the delivery
+    # arrived, so they have served their purpose.
+    (batch_dir / "SHA256SUMS").unlink(missing_ok=True)
+
     leftovers = [p for p in batch_dir.rglob("*") if p.is_file()]
     if leftovers:
-        log(f"{batch_id}: {len(leftovers)} file(s) left in the batch folder; keeping it")
+        # Something arrived that the batch did not describe. Keep it for a look,
+        # but out of ready/, or every later pass would pick it up again.
+        stash = cfg.failed / "_batches" / batch_id
+        stash.parent.mkdir(parents=True, exist_ok=True)
+        move_aside(stash)
+        shutil.move(str(batch_dir), str(stash))
+        log(f"{batch_id}: {len(leftovers)} file(s) were not described by the batch; kept in {stash}")
     else:
         shutil.rmtree(batch_dir, ignore_errors=True)
 
