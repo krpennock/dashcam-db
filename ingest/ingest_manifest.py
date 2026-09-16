@@ -543,7 +543,15 @@ def ingest_drive(
                            s.lat, s.lon, s.speed_knots, s.speed_mps, s.speed_mph,
                            s.course_deg, NULLIF(s.rmc_status,'')::char(1),
                            s.fix_quality, s.satellites, s.hdop, s.alt_m, s.geoid_sep_m,
-                           NULLIF(s.date_ddmmyy,''), NULLIF(s.time_hhmmss,'')
+                           -- The receiver sometimes emits a malformed sentence whose
+                           -- date field holds the time instead (173441.00 where
+                           -- 070126 belongs). The column is six characters wide, and
+                           -- such a value means nothing anyway, so it is dropped
+                           -- rather than failing the whole drive: five January drives
+                           -- sat unimported for months over a handful of these. The
+                           -- row's real timestamp comes from the start plus t_rel_s.
+                           CASE WHEN s.date_ddmmyy ~ '^[0-9]{6}$' THEN s.date_ddmmyy END,
+                           NULLIF(s.time_hhmmss,'')
                     FROM gnss_stage s
                     WHERE s.t_rel_s IS NOT NULL;
                     """,

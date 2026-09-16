@@ -339,6 +339,15 @@ def load_one_drive(
         return {"status": "failed", "folder": folder, "ok": False}
     except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
         raise TransientError(str(exc)) from exc
+    except psycopg.errors.DataError as exc:
+        # Something in the drive's own telemetry cannot be stored. That is a fact
+        # about the data, not a passing problem, so it is recorded in plain words
+        # rather than leaving a Python exception name on the Imports page.
+        record_item(conn, batch_id, item, status="failed",
+                    reason_code="BAD_TELEMETRY_VALUE",
+                    reason=f"a value in the telemetry files could not be stored: {exc}"[:500])
+        log(f"  {folder.name}: failed (a telemetry value could not be stored)")
+        return {"status": "failed", "folder": folder, "ok": False}
     except Exception as exc:  # unexpected, but one drive must not stop the batch
         record_item(conn, batch_id, item, status="failed",
                     reason_code="UNEXPECTED",
