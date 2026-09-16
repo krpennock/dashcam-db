@@ -244,6 +244,14 @@ def deliver_pending(
     log: Callable[[str], None] = print,
 ) -> dict[str, object]:
     """Send every processed drive that has not been delivered yet."""
+    # Parcels made up on an earlier run but never sent are discarded before a new
+    # one is made, so whatever they held travels in this parcel instead of
+    # waiting for the run after it. Anything actually sent is left alone: the
+    # server may still be working through it.
+    dropped = ledger.supersede_unshipped_batches(vehicle_tag)
+    if dropped:
+        log(f"{vehicle_tag}: {dropped} parcel(s) never left here; making a fresh one")
+
     ready = [
         row for row in ledger.drives_with_status("processed")
         if row["vehicle_tag"] == vehicle_tag and row["folder"]

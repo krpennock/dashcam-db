@@ -387,6 +387,48 @@ class Ledger:
             "SELECT * FROM batch WHERE confirmed_at IS NULL ORDER BY created_at;"
         ).fetchall()
 
+    def supersede_unshipped_batches(
+        self, vehicle_tag: str, keep_batch_id: Optional[str] = None
+    ) -> int:
+        """Throw away parcels that were made up but never sent.
+
+        When the server cannot be reached, the next run makes a fresh parcel --
+        rightly, because by then it may hold more drives. What it must not do is
+        leave the old one behind: nothing points at it, it can never be
+        confirmed, and it would sit in `status` for ever. A fortnight of the
+        server being away would otherwise leave a fortnight of dead parcels.
+
+        Drives pointing at a discarded parcel have their parcel cleared, so the
+        next one picks them up again. Without that a drive that is recorded but
+        not sent -- one too short to be a drive, say -- would never travel at
+        all, and would be missing from the Imports page for good.
+
+        Parcels that *were* sent are left alone however long they stay
+        unconfirmed, because the server may still be working through them.
+        """
+        if keep_batch_id is None:
+            rows = self.conn.execute(
+                "SELECT batch_id FROM batch WHERE vehicle_tag = ? AND shipped_at IS NULL;",
+                (vehicle_tag,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT batch_id FROM batch "
+                "WHERE vehicle_tag = ? AND shipped_at IS NULL AND batch_id <> ?;",
+                (vehicle_tag, keep_batch_id),
+            ).fetchall()
+        stale = [r["batch_id"] for r in rows]
+        if not stale:
+            return 0
+
+        marks = ", ".join("?" * len(stale))
+        self.conn.execute(
+            f"UPDATE drive SET batch_id = NULL WHERE vehicle_tag = ? AND batch_id IN ({marks});",
+            [vehicle_tag, *stale],
+        )
+        self.conn.execute(f"DELETE FROM batch WHERE batch_id IN ({marks});", stale)
+        return len(stale)
+
     # --- notifications ---------------------------------------------------
 
     def queue_message(self, kind: str, title: str, message: str,

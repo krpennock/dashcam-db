@@ -393,5 +393,132 @@ class HoldingWindowTests(unittest.TestCase):
         self.assertEqual(self.led.get_clip("camry", "20260806_094436_NF")["state"], "held")
 
 
+class InterruptedBuildTests(unittest.TestCase):
+    """A build cut short must be finished later, not silently abandoned.
+
+    The clip list is written down when the work is planned, before anything is
+    built. If the machine is turned off mid-build, the next run would otherwise
+    see those clips as "already here" and never build the drive -- which is the
+    worst kind of failure, because nothing reports it and no later run fixes it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
+        self.addCleanup(self.led.close)
+        self.stems = pair("20260806_082808") + pair("20260806_082909") + pair("20260806_083010")
+
+    def _known_drive(self, status: str) -> None:
+        self.led.record_drive("camry", "20260806_082808_camry", status=status, clip_pairs=3)
+        self.led.set_drive_clips("camry", "20260806_082808_camry", self.stems)
+
+    def test_a_drive_that_never_finished_is_built_again(self):
+        self._known_drive("planned")
+
+        plans = plan.plan_drives(self.led, "camry", self.stems)
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].match, plan.UNFINISHED)
+        self.assertTrue(plans[0].should_build, "an unfinished drive must be built")
+        self.assertEqual(plans[0].drive_tag, "20260806_082808_camry",
+                         "and must keep its identity, not become a second drive")
+
+    def test_a_finished_drive_is_still_left_alone(self):
+        self._known_drive("ingested")
+
+        plans = plan.plan_drives(self.led, "camry", self.stems)
+
+        self.assertEqual(plans[0].match, plan.UNCHANGED)
+        self.assertFalse(plans[0].should_build)
+
+    def test_an_unfinished_drive_that_also_grew_is_built_again(self):
+        # Interrupted while being extended: the commonest way to hit this.
+        self._known_drive("planned")
+        grown = self.stems + pair("20260806_083111")
+
+        plans = plan.plan_drives(self.led, "camry", grown)
+
+        self.assertEqual(plans[0].match, plan.UNFINISHED)
+        self.assertTrue(plans[0].should_build)
+        self.assertEqual(sorted(plans[0].stems), sorted(grown))
+
+
+class SupersededParcelTests(unittest.TestCase):
+    """Parcels made up while the server was away must not pile up.
+
+    Every run builds a fresh parcel, which is right: by then it may hold more
+    drives. The old one must not be left behind, because nothing points at it
+    and it can never be confirmed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
+        self.addCleanup(self.led.close)
+
+    def _parcel(self, batch_id: str, *, vehicle: str = "camry", shipped: bool = False) -> None:
+        self.led.record_batch(batch_id, vehicle_tag=vehicle, drives=1)
+        if shipped:
+            self.led.update_batch(batch_id, shipped_at="2026-09-16T01:00:00+00:00")
+
+    def test_an_unsent_parcel_is_replaced_by_the_next_one(self):
+        self._parcel("aaaa")
+        self.led.record_drive("camry", "20260806_082808_camry", status="processed", batch_id="aaaa")
+        self._parcel("bbbb")
+        self.led.set_drive_status("camry", "20260806_082808_camry", "processed", batch_id="bbbb")
+
+        dropped = self.led.supersede_unshipped_batches("camry", "bbbb")
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual([b["batch_id"] for b in self.led.unconfirmed_batches()], ["bbbb"])
+
+    def test_a_drive_left_on_a_discarded_parcel_travels_again(self):
+        # A drive too short to be sent still has to reach the Imports page, so
+        # clearing its parcel is what puts it in the next one.
+        self._parcel("aaaa")
+        self.led.record_drive("camry", "20260806_094536_camry",
+                              status="skipped_short", batch_id="aaaa")
+        self._parcel("bbbb")
+
+        self.led.supersede_unshipped_batches("camry", "bbbb")
+
+        row = self.led.get_drive("camry", "20260806_094536_camry")
+        self.assertIsNone(row["batch_id"], "it must be free to travel in the next parcel")
+
+    def test_a_parcel_already_sent_is_never_discarded(self):
+        # It may be sitting on the server waiting to be loaded.
+        self._parcel("aaaa", shipped=True)
+        self._parcel("bbbb")
+
+        dropped = self.led.supersede_unshipped_batches("camry", "bbbb")
+
+        self.assertEqual(dropped, 0)
+        self.assertEqual(len(self.led.unconfirmed_batches()), 2)
+
+    def test_clearing_them_all_frees_their_drives_for_the_next_parcel(self):
+        # This is how it is used for real: discard first, then make the new
+        # parcel, so nothing waits an extra run to travel.
+        self._parcel("aaaa")
+        self.led.record_drive("camry", "20260806_094536_camry",
+                              status="skipped_short", batch_id="aaaa")
+
+        dropped = self.led.supersede_unshipped_batches("camry")
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual(self.led.unconfirmed_batches(), [])
+        self.assertIsNone(self.led.get_drive("camry", "20260806_094536_camry")["batch_id"])
+
+    def test_the_other_car_is_left_alone(self):
+        self._parcel("aaaa")
+        self._parcel("cccc", vehicle="civic")
+
+        self.led.supersede_unshipped_batches("camry", "bbbb")
+
+        left = sorted(b["batch_id"] for b in self.led.unconfirmed_batches())
+        self.assertEqual(left, ["cccc"], "the other car's parcel must survive")
+
+
 if __name__ == "__main__":
     unittest.main()

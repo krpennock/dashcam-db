@@ -18,6 +18,11 @@ Two questions, and the second is the one that matters:
      copy of it.
    * **remnant** -- fewer clips than we already have, because the camera has
      since overwritten the earliest ones. Do nothing; we have the better copy.
+   * **unfinished** -- we started building this drive and never finished, because
+     the machine was turned off or the pipeline was killed part-way. Build it
+     again. Without this the drive would be stranded: its clip list was written
+     down when the work was planned, so the next run recognises those clips as
+     "already here" and never builds the drive at all.
    * **needs_review** -- these clips span two drives we know about, or overlap
      one only partly. Something is odd about the grouping and a person should
      look before anything is rebuilt.
@@ -44,7 +49,12 @@ NEW = "new"
 UNCHANGED = "unchanged"
 EXTENDED = "extended"
 REMNANT = "remnant"
+UNFINISHED = "unfinished"
 NEEDS_REVIEW = "needs_review"
+
+#: A drive sitting at this status was planned and never completed. Any other
+#: status means the work either finished or reached an outcome of its own.
+UNFINISHED_STATUS = "planned"
 
 
 @dataclass
@@ -66,8 +76,8 @@ class DrivePlan:
 
     @property
     def should_build(self) -> bool:
-        """Only a genuinely new or extended driving group is worth processing."""
-        return self.classification == "drive" and self.match in (NEW, EXTENDED)
+        """A new, extended or never-finished driving group is worth processing."""
+        return self.classification == "drive" and self.match in (NEW, EXTENDED, UNFINISHED)
 
     @property
     def clip_set_sha1(self) -> str:
@@ -193,6 +203,20 @@ def match_known(
         )
 
     tag, known = next(iter(touched.items()))
+
+    # Before comparing clip lists at all: was this drive ever actually finished?
+    # The clip list is written down when the work is planned, so a build cut
+    # short by a crash or a power cut leaves a drive claiming clips that were
+    # never built into anything. Comparing lists would call that "unchanged" and
+    # the drive would sit there for ever, never built and never sent.
+    row = ledger.get_drive(vehicle_tag, tag, view)
+    if row is not None and row["status"] == UNFINISHED_STATUS:
+        return (
+            UNFINISHED,
+            tag,
+            f"{tag} was started but never finished, so it is being built again",
+        )
+
     if wanted == known:
         return UNCHANGED, tag, None
     if wanted > known:
