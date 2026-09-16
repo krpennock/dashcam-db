@@ -328,14 +328,21 @@ class Ledger:
         ).fetchall()
 
     def clip_is_safe_to_delete(self, vehicle_tag: str, stem: str) -> bool:
-        """True only when every drive holding this clip is in the database.
+        """True only when this clip is claimed by drives that are all settled.
 
         A clip belonging to a drive that has not been loaded is never deleted by
         the holding window, however old it is.
+
+        A clip claimed by *no* drive is also kept. That looks over-cautious --
+        such a clip was acquired and never planned -- but the alternative is
+        worse: if the drive records were ever lost or damaged, every held clip
+        would suddenly look unclaimed and the holding window would delete the
+        video. Keeping them costs disk; the other way costs footage. `prune`
+        reports them separately so they stay visible.
         """
         drives = self.drives_for_clip(vehicle_tag, stem)
         if not drives:
-            return True  # belongs to nothing we are waiting on
+            return False
         settled = {"ingested", "skipped_short", "parking_only", "failed"}
         return all(d["status"] in settled for d in drives)
 

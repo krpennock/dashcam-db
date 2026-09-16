@@ -256,5 +256,142 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(listed, names)
 
 
+class RetentionSafetyTests(unittest.TestCase):
+    """What may be deleted from the holding folder, and what may never be.
+
+    These exist because of a real near-miss: a careless bulk delete wiped the
+    links between clips and drives. With the old rule -- "no drive claims this
+    clip, so it can go" -- the next clean-up would have deleted held video for
+    drives that had not reached the database.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
+        self.addCleanup(self.led.close)
+
+    def _clip(self, stem: str) -> None:
+        self.led.record_clip(vehicle_tag="camry", stem=stem, ts_key=stem[:15],
+                             channel="front", clip_type="N", size_bytes=1, state="held")
+
+    def test_a_clip_no_drive_claims_is_kept(self):
+        self._clip("20260806_094436_NF")
+        self.assertFalse(self.led.clip_is_safe_to_delete("camry", "20260806_094436_NF"))
+
+    def test_a_clip_of_a_drive_not_yet_loaded_is_kept(self):
+        self._clip("20260806_094436_NF")
+        self.led.record_drive("camry", "20260806_094436_camry", status="processed")
+        self.led.set_drive_clips("camry", "20260806_094436_camry", ["20260806_094436_NF"])
+        self.assertFalse(self.led.clip_is_safe_to_delete("camry", "20260806_094436_NF"))
+
+    def test_a_clip_of_a_loaded_drive_may_go(self):
+        self._clip("20260806_094436_NF")
+        self.led.record_drive("camry", "20260806_094436_camry", status="ingested")
+        self.led.set_drive_clips("camry", "20260806_094436_camry", ["20260806_094436_NF"])
+        self.assertTrue(self.led.clip_is_safe_to_delete("camry", "20260806_094436_NF"))
+
+    def test_one_unsettled_claim_is_enough_to_keep_it(self):
+        """A clip shared by two drives is kept while either is outstanding."""
+        self._clip("20260806_094436_NF")
+        for tag, status in (("20260806_094436_camry", "ingested"),
+                            ("20260806_094400_camry", "planned")):
+            self.led.record_drive("camry", tag, status=status)
+            self.led.set_drive_clips("camry", tag, ["20260806_094436_NF"])
+        self.assertFalse(self.led.clip_is_safe_to_delete("camry", "20260806_094436_NF"))
+
+
+class HoldingWindowTests(unittest.TestCase):
+    """How long held video is kept, and from when it is counted.
+
+    The window is measured from when a clip was copied here, not from when it was
+    filmed. A card left in a car for months holds footage that is already older
+    than the window; counting by the recording date copied it off the card and
+    deleted it a second later.
+    """
+
+    def setUp(self):
+        # Cleanups run last-added-first, so the ledger is closed before the
+        # folder holding its SQLite file is taken away.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = self._config(Path(self.tmp.name))
+        self.led = Ledger(self.cfg.ledger_path)
+        self.addCleanup(self.led.close)
+
+    def _config(self, root: Path, days: int = 14):
+        from dashcam_pipeline.config import load
+
+        (root / "holding").mkdir(parents=True, exist_ok=True)
+        toml = root / "config.toml"
+        toml.write_text(
+            "[paths]\n"
+            f"state_dir = '{root / 'state'}'\n"
+            "[holding]\n"
+            f"path = '{root / 'holding'}'\n"
+            f"days = {days}\n"
+            "max_gb = 800\n"
+            "min_free_gb = 1\n"
+            "[[vehicles]]\n"
+            "serial = 'ELT9K1OBE00076'\n"
+            "tag = 'camry'\n"
+            f"output_root = '{root / 'processed'}'\n",
+            encoding="utf-8",
+        )
+        return load(toml)
+
+    def _held_clip(self, led: Ledger, cfg, stem: str, acquired: str) -> Path:
+        path = cfg.holding_path / f"{stem}.mp4"
+        path.write_bytes(b"x" * 1024)
+        led.record_clip(vehicle_tag="camry", stem=stem, ts_key=stem[:15], channel="front",
+                        clip_type="N", size_bytes=1024, state="held",
+                        held_path=str(path), acquired_at=acquired)
+        led.record_drive("camry", f"{stem[:15]}_camry", status="ingested")
+        led.set_drive_clips("camry", f"{stem[:15]}_camry", [stem])
+        return path
+
+    def test_footage_filmed_long_ago_but_copied_today_is_kept(self):
+        from datetime import datetime, timezone
+
+        from dashcam_pipeline import retain
+
+        # Filmed in August, copied off the card a moment ago.
+        just_now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        fresh = self._held_clip(self.led, self.cfg, "20260806_094436_NF", just_now)
+
+        report = retain.prune(self.cfg, self.led, dry_run=False, log=lambda _m: None)
+
+        self.assertTrue(fresh.is_file(), "video copied today must not be deleted today")
+        self.assertEqual(report.deleted, 0)
+
+    def test_footage_copied_long_ago_is_removed(self):
+        from datetime import datetime, timedelta, timezone
+
+        from dashcam_pipeline import retain
+
+        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat(timespec="seconds")
+        stale = self._held_clip(self.led, self.cfg, "20260806_094436_NF", old)
+
+        report = retain.prune(self.cfg, self.led, dry_run=False, log=lambda _m: None)
+
+        self.assertFalse(stale.is_file())
+        self.assertEqual(report.deleted, 1)
+        self.assertEqual(self.led.get_clip("camry", "20260806_094436_NF")["state"], "purged")
+
+    def test_a_dry_run_removes_nothing(self):
+        from datetime import datetime, timedelta, timezone
+
+        from dashcam_pipeline import retain
+
+        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat(timespec="seconds")
+        stale = self._held_clip(self.led, self.cfg, "20260806_094436_NF", old)
+
+        report = retain.prune(self.cfg, self.led, dry_run=True, log=lambda _m: None)
+
+        self.assertTrue(stale.is_file())
+        self.assertEqual(report.deleted, 1, "a dry run still reports what it would remove")
+        self.assertEqual(self.led.get_clip("camry", "20260806_094436_NF")["state"], "held")
+
+
 if __name__ == "__main__":
     unittest.main()

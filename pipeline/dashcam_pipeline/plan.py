@@ -256,20 +256,28 @@ def summarise(plans: Sequence[DrivePlan]) -> str:
     """One line describing a set of decisions, for a log or a notification."""
     if not plans:
         return "nothing to do"
-    bits: list[str] = []
-    build = [p for p in plans if p.should_build]
-    if build:
-        bits.append(f"{len(build)} to build")
-    for kind, label in (
-        (UNCHANGED, "already here"),
-        (REMNANT, "partly overwritten"),
-        (NEEDS_REVIEW, "needing a look"),
-    ):
-        n = sum(1 for p in plans if p.match == kind)
-        if n:
-            bits.append(f"{n} {label}")
-    for kind, label in (("parking_only", "parked"), ("skipped_short", "too short")):
-        n = sum(1 for p in plans if p.classification == kind)
-        if n:
-            bits.append(f"{n} {label}")
-    return ", ".join(bits)
+
+    # One outcome per drive, most specific first, or a single group turns up
+    # twice: once for what it matched and again for what it is.
+    order = ["to build", "needing a look", "already here", "partly overwritten",
+             "parked", "too short"]
+    counts: dict[str, int] = {}
+
+    for p in plans:
+        if p.should_build:
+            label = "to build"
+        elif p.match == NEEDS_REVIEW:
+            label = "needing a look"
+        elif p.match == UNCHANGED:
+            label = "already here"
+        elif p.match == REMNANT:
+            label = "partly overwritten"
+        elif p.classification == "parking_only":
+            label = "parked"
+        elif p.classification == "skipped_short":
+            label = "too short"
+        else:
+            label = "to build"
+        counts[label] = counts.get(label, 0) + 1
+
+    return ", ".join(f"{counts[label]} {label}" for label in order if label in counts)
