@@ -1,0 +1,100 @@
+# Dashcam pipeline configuration.
+#
+# Copy to %LOCALAPPDATA%\dashcam-pipeline\config.toml and edit. Paths are
+# written as literal strings (single quotes), so Windows backslashes need no
+# escaping. %VAR% and ~ are expanded when the file is read.
+
+[paths]
+# Everything the pipeline remembers: its ledger, its logs, and the clips it has
+# copied off a card but not yet processed.
+state_dir   = 'F:\Dashcam\_pipeline'
+staging_dir = 'F:\Dashcam\_pipeline\staging'
+
+# Clips whose filename appears anywhere under these folders are never deleted by
+# the holding-window clean-up, however old they get.
+keep_dirs   = ['F:\Dashcam\Interesting']
+
+# Deletions move here first, so a mistake is recoverable.
+trash_dir   = 'F:\Dashcam\_trash'
+
+# Never treat a volume with these drive letters as a camera card, whatever is on
+# it. C: is this machine; F: holds the archive itself.
+exclude_volumes = ['C:', 'F:']
+
+[tools]
+blackclue = 'C:\Users\krpen\AppData\Local\Python\pythoncore-3.14-64\Scripts\blackclue.exe'
+ffmpeg    = 'C:\dev\ffmpeg\bin\ffmpeg.exe'
+ffprobe   = 'C:\dev\ffmpeg\bin\ffprobe.exe'
+python    = 'python'
+
+[processing]
+# Passed through to pipeline/blackvue_drives.py. These match the hand-written
+# RunDrivesCamry.txt / RunDrivesCivic.txt commands.
+clip_seconds        = 60
+gap_seconds         = 120
+min_drive_clips     = 3
+blackclue_mode      = 'complete'
+blackclue_view      = 'front'
+blackclue_jobs      = 4
+stills_every_seconds = 30
+stills_width        = 1920
+stills_format       = 'jpg'
+stills_quality      = 3
+stills_name         = 'utc'
+ffmpeg_hwaccel      = 'auto'
+timezone            = 'America/Chicago'
+
+# The cameras run on a fixed offset from UTC with no daylight saving. This is
+# what a clip filename means, and it is not the same thing as the timezone above.
+camera_utc_offset   = '-06:00'
+
+# Clip types that count as driving: normal, event, manual, impact. A group made
+# up only of parking clips is recorded as "parked" and not loaded, but its video
+# is still held.
+driving_types       = ['N', 'E', 'M', 'I']
+max_failed_clip_ratio = 0.2
+
+[holding]
+# Raw front and rear clips are kept here after processing, so a drive can be
+# re-cut or exported later. Can be a local path or a UNC share.
+path        = 'F:\Dashcam\Holding'
+days        = 14
+max_gb      = 800
+min_free_gb = 100
+
+[server]
+host          = '192.168.1.164'
+user          = 'kpennock'
+identity_file = '~\.ssh\dashcam_pipeline_ed25519'
+api_base      = 'http://192.168.1.164:8000'
+viewer_base   = 'http://192.168.1.164:8080'
+
+[ntfy]
+url        = 'http://192.168.1.164:8090'
+topic      = 'dashcam'
+# The token is kept out of this file and out of git.
+token_file = '%LOCALAPPDATA%\dashcam-pipeline\ntfy_token.txt'
+
+# One block per camera. The serial is what identifies a card: it is embedded in
+# the first few megabytes of every clip, so the pipeline can tell the cars apart
+# without being told which card was inserted.
+[[vehicles]]
+serial      = 'ELT9K1OBE00076'
+tag         = 'camry'
+model       = 'ELITE9-2CH'
+firmware    = 'V1.004'
+output_root = 'F:\Dashcam\Processed_Camry'
+
+[[vehicles]]
+serial      = 'ELT8S1O7E03788'
+tag         = 'civic'
+model       = 'ELITE8-2CH'
+firmware    = 'V1.004'
+output_root = 'F:\Dashcam\Processed_Civic'
+
+# Where footage comes from. Only removable cards today; a Wi-Fi source can be
+# added later without the rest of the pipeline changing.
+[[sources]]
+kind = 'sdcard'
+# Clips live under <drive>\BlackVue\Record on a BlackVue card.
+subpath = 'BlackVue\Record'
