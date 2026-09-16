@@ -1,0 +1,36 @@
+# ntfy, self-hosted, for phone notifications from the dashcam pipeline.
+#
+# Nobody may read or write without an account (auth-default-access: deny-all).
+# Two accounts are created by hand after the first start:
+#
+#   docker exec -it dashcam-ntfy ntfy user add phone
+#   docker exec -it dashcam-ntfy ntfy access phone dashcam read-only
+#   docker exec -it dashcam-ntfy ntfy user add --role=user pipeline
+#   docker exec -it dashcam-ntfy ntfy access pipeline dashcam write-only
+#   docker exec -it dashcam-ntfy ntfy token add pipeline
+#
+# The token goes in the server's .env as NTFY_TOKEN and in a file on the PC. It
+# does not belong in git.
+
+base-url: http://192.168.1.164:8090
+listen-http: ":80"
+
+auth-file: /var/lib/ntfy/user.db
+auth-default-access: deny-all
+
+# An iPhone cannot hold a background connection to a server on the home network,
+# so messages are also handed to ntfy.sh, which wakes the phone. Only a random
+# topic id travels that way, never the message: the phone then fetches the real
+# message from here.
+upstream-base-url: https://ntfy.sh
+
+cache-file: /var/lib/ntfy/cache.db
+cache-duration: 72h
+
+attachment-cache-dir: /var/lib/ntfy/attachments
+attachment-total-size-limit: 1G
+attachment-expiry-duration: 24h
+
+behind-proxy: false
+enable-signup: false
+enable-login: true

@@ -10,6 +10,10 @@ services:
       TZ: ${TZ}
     ports:
       - "5432:5432"
+    # Parallel maintenance (VACUUM, index builds) needs more than Docker's
+    # default 64 MB of shared memory, or it fails with "could not resize shared
+    # memory segment".
+    shm_size: 1gb
     volumes:
       - dashcam_db:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
@@ -50,6 +54,51 @@ services:
       api:
         condition: service_started
 
+  # Watches the import tree and loads whatever the PC ships in.
+  importer:
+    build: ./ingest
+    container_name: dashcam-importer
+    restart: unless-stopped
+    entrypoint: ["python", "-m", "importer.run"]
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      IMPORT_ROOT: /import
+      MEDIA_ROOT: /media
+      IMPORTER_POLL_SECONDS: "15"
+      IMPORTER_MIN_FREE_GB: "10"
+      NTFY_URL: ${NTFY_URL:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      NTFY_TOKEN: ${NTFY_TOKEN:-}
+      VIEWER_URL: ${VIEWER_URL:-}
+      TZ: ${TZ}
+    volumes:
+      # Read-write, unlike the one-off ingest service: this one files drive
+      # folders into done/ and failed/ as it goes.
+      - ${IMPORT_ROOT:-./import}:/import:rw
+      - ./media:/media:rw
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Phone notifications. Self-hosted, with ntfy.sh as a relay so an iPhone can be
+  # woken; the message itself still comes from here.
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    container_name: dashcam-ntfy
+    restart: unless-stopped
+    command: ["serve"]
+    environment:
+      TZ: ${TZ}
+    ports:
+      - "8090:80"
+    volumes:
+      - ./ntfy/server.yml:/etc/ntfy/server.yml:ro
+      - ntfy_data:/var/lib/ntfy
+
   ingest:
     build: ./ingest
     profiles: ["tools"]
@@ -68,3 +117,4 @@ services:
 
 volumes:
   dashcam_db:
+  ntfy_data:
