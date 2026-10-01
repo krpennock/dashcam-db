@@ -5,10 +5,8 @@
 # escaping. %VAR% and ~ are expanded when the file is read.
 
 [paths]
-# Everything the pipeline remembers: its ledger, its logs, and the clips it has
-# copied off a card but not yet processed.
+# Everything the pipeline remembers: its ledger and its logs.
 state_dir   = 'F:\Dashcam\_pipeline'
-staging_dir = 'F:\Dashcam\_pipeline\staging'
 
 # Clips whose filename appears anywhere under these folders are never deleted by
 # the holding-window clean-up, however old they get.
@@ -22,7 +20,8 @@ trash_dir   = 'F:\Dashcam\_trash'
 exclude_volumes = ['C:', 'F:']
 
 [tools]
-blackclue = 'C:\Users\krpen\AppData\Local\Python\pythoncore-3.14-64\Scripts\blackclue.exe'
+# Only needed with telemetry_reader = 'blackclue' below.
+# blackclue = 'C:\Users\krpen\AppData\Local\Python\pythoncore-3.14-64\Scripts\blackclue.exe'
 ffmpeg    = 'C:\dev\ffmpeg\bin\ffmpeg.exe'
 ffprobe   = 'C:\dev\ffmpeg\bin\ffprobe.exe'
 python    = 'python'
@@ -33,15 +32,18 @@ python    = 'python'
 clip_seconds        = 60
 gap_seconds         = 120
 min_drive_clips     = 3
-blackclue_mode      = 'complete'
+# Telemetry is read in-process from each clip's own data block, and nothing is
+# written beside the clip, so a card is only ever read. 'blackclue' runs the
+# external tool instead; it needs [tools] blackclue and writes sidecars.
+telemetry_reader    = 'builtin'
 blackclue_view      = 'front'
-blackclue_jobs      = 4
+telemetry_jobs      = 4
+stills_jobs         = 4
 stills_every_seconds = 30
 stills_width        = 1920
 stills_format       = 'jpg'
 stills_quality      = 3
 stills_name         = 'utc'
-ffmpeg_hwaccel      = 'auto'
 timezone            = 'America/Chicago'
 
 # The cameras run on a fixed offset from UTC with no daylight saving. This is
@@ -55,8 +57,9 @@ driving_types       = ['N', 'E', 'M', 'I']
 max_failed_clip_ratio = 0.2
 
 [holding]
-# Raw front and rear clips are kept here after processing, so a drive can be
-# re-cut or exported later. Can be a local path or a UNC share.
+# The pipeline no longer copies video: clips are processed straight off the
+# card. These settings only govern video copied before that change, which is
+# pruned by age and size until the folder has drained.
 path        = 'F:\Dashcam\Holding'
 days        = 14
 max_gb      = 800

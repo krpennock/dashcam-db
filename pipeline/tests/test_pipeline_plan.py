@@ -504,12 +504,11 @@ class ImportMessageTests(unittest.TestCase):
 
 
 class AlreadyProcessedTests(unittest.TestCase):
-    """A card that was never erased must not be copied all over again.
+    """A card that was never erased must not be processed all over again.
 
-    The planner knows which drives are already done, but it only finds that out
-    after the whole card has been copied. Noting the clips themselves is what
-    stops a 238 GB card being copied in full to reach the conclusion that there
-    is nothing to do.
+    The planner knows which drives are already done, but only once their clips
+    are put in front of it. Noting the clips themselves is what stops a card of
+    1,300 already-loaded clips being planned, built and delivered again.
     """
 
     def setUp(self):
@@ -518,24 +517,22 @@ class AlreadyProcessedTests(unittest.TestCase):
         self.led = Ledger(Path(self.tmp.name) / "state.sqlite")
         self.addCleanup(self.led.close)
 
-    def _would_copy(self, stem: str, vehicle: str = "civic") -> bool:
-        from types import SimpleNamespace
+    def _would_process(self, stem: str, vehicle: str = "civic") -> bool:
+        from dashcam_pipeline.acquire import is_known
 
-        from dashcam_pipeline.acquire import _already_have
+        return not is_known(self.led, vehicle, stem)
 
-        return not _already_have(self.led, vehicle, SimpleNamespace(stem=stem))
-
-    def test_a_clip_from_a_drive_already_loaded_is_not_copied_again(self):
+    def test_a_clip_from_a_drive_already_loaded_is_not_processed_again(self):
         self.led.record_archived_clips("civic", ["20260721_131853_EF", "20260721_131853_ER"])
 
-        self.assertFalse(self._would_copy("20260721_131853_EF"))
-        self.assertFalse(self._would_copy("20260721_131853_ER"))
+        self.assertFalse(self._would_process("20260721_131853_EF"))
+        self.assertFalse(self._would_process("20260721_131853_ER"))
 
-    def test_a_clip_never_seen_before_is_still_copied(self):
+    def test_a_clip_never_seen_before_is_still_processed(self):
         self.led.record_archived_clips("civic", ["20260721_131853_EF"])
 
-        self.assertTrue(self._would_copy("20260810_210322_IF"),
-                        "genuinely new footage must still come off the card")
+        self.assertTrue(self._would_process("20260810_210322_IF"),
+                        "genuinely new footage must still be processed")
 
     def test_video_we_are_really_holding_is_not_downgraded_to_a_note(self):
         self.led.record_clip(
@@ -568,7 +565,7 @@ class AlreadyProcessedTests(unittest.TestCase):
     def test_the_other_car_is_unaffected(self):
         self.led.record_archived_clips("civic", ["20260806_082808_NF"])
 
-        self.assertTrue(self._would_copy("20260806_082808_NF", vehicle="camry"),
+        self.assertTrue(self._would_process("20260806_082808_NF", vehicle="camry"),
                         "the same filename on the other car's card is different footage")
 
 

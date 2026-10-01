@@ -4,8 +4,8 @@ A small SQLite file (``state.sqlite`` under the state folder) recording every
 clip it has seen, every drive it has built, every delivery it has sent, and every
 notification it still owes. It is what makes the pipeline safe to interrupt:
 
-* a clip already in here is never copied off a card again, so re-inserting a card
-  is cheap and produces nothing;
+* a clip already in here is never processed off a card again, so re-inserting a
+  card is cheap and produces nothing;
 * a drive already built is never rebuilt, and a drive already loaded is never
   sent twice;
 * the holding-window clean-up can tell which clips still belong to a drive that
@@ -24,15 +24,27 @@ from typing import Any, Iterable, Iterator, Optional
 
 SCHEMA_VERSION = 1
 
-#: A clip's life: copied off the card, moved to the holding folder, deleted by
-#: the holding window, or found to disagree with a clip we already had.
+#: A clip's life.
 #:
-#: "archived" is the odd one out: it is a note that a clip was already processed
-#: before this pipeline existed, so its video lives wherever it was put at the
-#: time rather than in the holding folder. Nothing here holds it, and nothing
-#: here will delete it -- it exists so that a card which was never erased is not
-#: copied all over again.
-CLIP_STATES = ("staged", "held", "purged", "conflict", "archived")
+#: "seen" is the normal case now: the clip was read straight off the card for its
+#: telemetry and stills, and no copy of the video exists anywhere on this
+#: machine. The row is what stops the clip being processed again, and what the
+#: safe-to-erase check consults.
+#:
+#: "staged", "held" and "purged" are the older copy-first life: copied off the
+#: card, moved to the holding folder, deleted by the holding window. Nothing is
+#: staged any more, but video already in holding is still looked after until the
+#: window lets it go.
+#:
+#: "archived" is a note that a clip was processed before this pipeline existed,
+#: so its video lives wherever it was put at the time. Nothing here holds it and
+#: nothing here will delete it; it exists so a card that was never erased is not
+#: processed all over again.
+CLIP_STATES = ("seen", "staged", "held", "purged", "conflict", "archived")
+
+#: Drive outcomes after which a clip's footage no longer depends on the card:
+#: the database has it, or it was deliberately not loaded.
+SETTLED_FOR_ERASE = ("ingested", "skipped_short", "parking_only")
 
 #: A drive's life. The last four are outcomes, not failures to retry.
 DRIVE_STATES = (
@@ -286,6 +298,29 @@ class Ledger:
             (vehicle_tag, ts_key_from, ts_key_to),
         ).fetchall()
 
+    def unsettled_stems(self, vehicle_tag: str, stems: Iterable[str]) -> list[str]:
+        """Which of these clips still depend on the card they are on.
+
+        A clip is settled when a copy of its video exists or existed here (the
+        older copy-first flow), or when every drive claiming it has reached the
+        database or was deliberately not loaded. A clip claimed by no drive is
+        not settled: nothing has been decided about it yet. Erasing a card
+        while any of its clips is unsettled would lose footage the database
+        does not have.
+        """
+        out: list[str] = []
+        for stem in stems:
+            row = self.get_clip(vehicle_tag, stem)
+            if row is None:
+                out.append(stem)
+                continue
+            if row["state"] in ("staged", "held", "purged", "archived"):
+                continue
+            drives = self.drives_for_clip(vehicle_tag, stem)
+            if not drives or any(d["status"] not in SETTLED_FOR_ERASE for d in drives):
+                out.append(stem)
+        return out
+
     # --- drives ----------------------------------------------------------
 
     def record_drive(self, vehicle_tag: str, drive_tag: str, *, view: str = "front", **fields: Any) -> None:
@@ -358,6 +393,22 @@ class Ledger:
         rows = self.conn.execute(
             "SELECT stem FROM drive_clip WHERE vehicle_tag = ? AND drive_tag = ? ORDER BY stem;",
             (vehicle_tag, drive_tag),
+        ).fetchall()
+        return [r["stem"] for r in rows]
+
+    def stems_of_drives(self, vehicle_tag: str, *statuses: str) -> list[str]:
+        """Every clip claimed by this vehicle's drives in the given statuses.
+
+        Used to bring a drive that was planned but never finished back into
+        planning on the next pass, so it is built once its clips are available
+        again.
+        """
+        marks = ", ".join("?" * len(statuses))
+        rows = self.conn.execute(
+            f"SELECT DISTINCT c.stem FROM drive_clip c JOIN drive d "
+            f"  ON d.vehicle_tag = c.vehicle_tag AND d.drive_tag = c.drive_tag "
+            f"WHERE c.vehicle_tag = ? AND d.status IN ({marks}) ORDER BY c.stem;",
+            (vehicle_tag, *statuses),
         ).fetchall()
         return [r["stem"] for r in rows]
 

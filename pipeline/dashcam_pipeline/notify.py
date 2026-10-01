@@ -5,7 +5,7 @@ notification is never lost because the network was down, the server was asleep,
 or the phone was out of reach. Anything unsent is retried on the next pass.
 
 Sending is always best-effort: a notification that cannot be delivered must never
-stop a card being copied or a drive being loaded.
+stop a card being processed or a drive being loaded.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from .ledger import Ledger
 MAX_ATTEMPTS = 8
 
 #: Kinds of message, so the pipeline's own code reads clearly at the call site.
-CARD_COPIED = "card_copied"
+CARD_FOUND = "card_found"
 SAFE_TO_ERASE = "safe_to_erase"
 NOTHING_NEW = "nothing_new"
 CARD_REMOVED = "card_removed"
@@ -94,39 +94,52 @@ def send_now(cfg: Config, ledger: Ledger, kind: str, title: str, message: str,
 # The messages themselves, in one place so the wording stays consistent
 # --------------------------------------------------------------------------
 
-def card_copied(ledger: Ledger, vehicle: str, clips: int, gigabytes: float) -> None:
-    queue(
-        ledger, CARD_COPIED,
-        f"{vehicle}: card copied",
-        f"{clips} new clip{'s' if clips != 1 else ''} copied ({gigabytes:.1f} GB). Processing now.",
-        tags="inbox_tray",
-    )
+def card_found(ledger: Ledger, vehicle: str, new_clips: int, to_build: int) -> None:
+    body = f"{new_clips} new clip{'s' if new_clips != 1 else ''} on the card"
+    if to_build:
+        body += (f"; {to_build} drive{'s' if to_build != 1 else ''} being processed "
+                 f"straight off it now. Leave the card in.")
+    else:
+        body += ", none of it a drive to load."
+    queue(ledger, CARD_FOUND, f"{vehicle}: card found", body, tags="inbox_tray")
 
 
 def safe_to_erase(ledger: Ledger, vehicle: str, clips: int) -> None:
     queue(
         ledger, SAFE_TO_ERASE,
         f"{vehicle}: safe to erase the card",
-        f"All {clips} clip{'s' if clips != 1 else ''} on the card are copied and verified. "
-        f"The card can be formatted in the camera whenever you like.",
+        f"All {clips} clip{'s' if clips != 1 else ''} on the card are in the database or "
+        f"accounted for. The card can be formatted in the camera whenever you like.",
         tags="white_check_mark",
     )
 
 
-def nothing_new(ledger: Ledger, vehicle: str) -> None:
+def nothing_new(ledger: Ledger, vehicle: str, waiting: int = 0) -> None:
+    """The card holds nothing we have not seen. Whether it can go depends on
+    whether everything on it has reached the database yet."""
+    if waiting:
+        queue(
+            ledger, NOTHING_NEW,
+            f"{vehicle}: nothing new, but keep the card",
+            f"Everything on the card is already known, but {waiting} clip"
+            f"{'s' if waiting != 1 else ''} still depend on it: a drive is unfinished, "
+            f"failed, or waiting for the database. Leave the card in, or put it back later.",
+            tags="hourglass", priority="high",
+        )
+        return
     queue(
         ledger, NOTHING_NEW,
         f"{vehicle}: nothing new",
-        "Everything on the card is already here. Safe to erase.",
+        "Everything on the card is already in the database or accounted for. Safe to erase.",
         tags="white_check_mark",
     )
 
 
-def card_removed(ledger: Ledger, vehicle: str, copied: int, remaining: int) -> None:
+def card_removed(ledger: Ledger, vehicle: str, built: int, remaining: int) -> None:
     queue(
         ledger, CARD_REMOVED,
-        f"{vehicle}: card removed while copying",
-        f"{copied} clip{'s' if copied != 1 else ''} copied, {remaining} still to go. "
+        f"{vehicle}: card removed while processing",
+        f"{built} drive{'s' if built != 1 else ''} done, {remaining} still to go. "
         f"Put the card back in and it will carry on where it stopped.",
         tags="warning", priority="high",
     )
@@ -173,13 +186,18 @@ def holding_full(ledger: Ledger, used_gb: float, cap_gb: float, free_gb: float) 
 
 def import_done(ledger: Ledger, vehicle: str, loaded: int, failed: int,
                 batch_id: str, viewer_base: str = "",
-                recorded: int = 0, for_review: int = 0) -> None:
+                recorded: int = 0, for_review: int = 0,
+                card_safe: Optional[bool] = None) -> None:
     """Say what became of a delivery, including what was never meant to load.
 
     A recording too short to be a drive, or one made while parked, is noted but
     deliberately not loaded. Counting only loads and failures produced the
     message "0 drives loaded" when seven such recordings had been handled
     perfectly well, which reads like a failure when nothing went wrong.
+
+    ``card_safe`` says whether the card this came from, if it is still in the
+    reader, can now be erased: nothing on it depends on it any more. None means
+    the card has already gone, so there is nothing to say.
     """
     if loaded:
         body = f"{loaded} drive{'s' if loaded != 1 else ''} loaded"
@@ -195,6 +213,10 @@ def import_done(ledger: Ledger, vehicle: str, loaded: int, failed: int,
         body += f"\n{failed} did not load"
     if for_review:
         body += f"\n{for_review} set aside for a look"
+    if card_safe is True:
+        body += "\nEverything on the card is in the database or accounted for: safe to erase it."
+    elif card_safe is False:
+        body += "\nKeep the card for now: something on it has not reached the database yet."
     if viewer_base:
         body += f"\n{viewer_base}/imports.html?batch={batch_id}"
 

@@ -6,6 +6,10 @@ the script is told which drive this is rather than working it out for itself, so
 a drive that is processed again lands on the same identity and updates the drive
 already in the database instead of becoming a second copy of it.
 
+The clips are read where they are, which is normally on the card. The script
+reads each clip's telemetry block in-process and seeks its stills out of the
+clip, and writes nothing beside the clips, so the card is only ever read.
+
 Its exit code is the contract:
 
     0   built
@@ -76,6 +80,7 @@ def build_command(
     """The drives-script command line for one drive."""
     p = cfg.processing
     python = cfg.tools.get("python") or "python"
+    reader = str(p.get("telemetry_reader") or "builtin")
 
     cmd = [
         python, str(DRIVES_SCRIPT),
@@ -91,13 +96,11 @@ def build_command(
         "--gap-seconds", str(p.get("gap_seconds") or 120),
         "--max-failed-clip-ratio", str(p.get("max_failed_clip_ratio") or 0.2),
         "--run-blackclue",
-        "--blackclue", cfg.tools.get("blackclue") or "blackclue",
-        "--blackclue-mode", str(p.get("blackclue_mode") or "complete"),
+        "--telemetry-reader", reader,
         "--blackclue-view", str(p.get("blackclue_view") or "front"),
-        "--blackclue-jobs", str(p.get("blackclue_jobs") or 4),
-        "--telemetry-sidecar-action", "move",
+        "--blackclue-jobs", str(p.get("telemetry_jobs") or p.get("blackclue_jobs") or 4),
         "--ffmpeg", cfg.tools.get("ffmpeg") or "ffmpeg",
-        "--ffmpeg-hwaccel", str(p.get("ffmpeg_hwaccel") or "auto"),
+        "--stills-jobs", str(p.get("stills_jobs") or 4),
         "--emit-csv", "--emit-gpx", "--emit-accel",
         "--emit-stills",
         "--stills-every-seconds", str(p.get("stills_every_seconds") or 30),
@@ -110,6 +113,12 @@ def build_command(
         "--emit-manifest",
         "--skip-existing",
     ]
+    if reader == "blackclue":
+        # The external tool writes its sidecars beside each clip, so they are
+        # moved into the drive folder afterwards. Never point this at a card.
+        cmd += ["--blackclue", cfg.tools.get("blackclue") or "blackclue",
+                "--blackclue-mode", str(p.get("blackclue_mode") or "complete"),
+                "--telemetry-sidecar-action", "move"]
     if cfg.tools.get("ffprobe"):
         cmd += ["--ffprobe", cfg.tools["ffprobe"]]
     if vehicle.model:

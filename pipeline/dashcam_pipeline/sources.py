@@ -1,22 +1,20 @@
 """Where clips come from, and how they are read.
 
-Today that is a camera card in a reader. A folder of already-copied clips uses
-the same interface, which is how the backlog is handled, and a Wi-Fi source can
-be added later without anything else changing.
+Today that is a camera card in a reader. A folder of clips already on this
+machine uses the same interface, which is how a backlog is handled, and a Wi-Fi
+source can be added later without anything else changing.
 
-**A card is never written to.** No sidecar files, no deletions, no renames: the
-pipeline copies what it needs and tells you when the card is safe to erase. That
-is why processing always happens on the copy — the telemetry tool writes its
-output next to the file it reads, so pointing it at a card would write to the
-card.
+**A card is only ever read.** The drives script reads each clip's telemetry
+block and seeks out its stills directly from the card, and everything it writes
+goes into the drive's own work folder. Nothing is copied first: the database
+needs under three percent of each clip, and copying the whole card took longer
+than everything else put together.
 """
 from __future__ import annotations
 
 import ctypes
 import datetime as _dt
-import hashlib
 import re
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, Protocol, runtime_checkable
@@ -30,9 +28,9 @@ CLIP_RE = re.compile(
 #: every clip the camera writes.
 SERIAL_RE = re.compile(rb"ELT[0-9A-Z]{11}")
 
-#: How much of a clip to read when looking for the serial, and when fingerprinting.
+#: How much of a clip to read when looking for the serial. It sits in the
+#: telemetry block within the first megabyte; this leaves room to spare.
 SERIAL_SCAN_BYTES = 4 * 1024 * 1024
-FINGERPRINT_BYTES = 1024 * 1024
 
 DRIVE_REMOVABLE = 2
 DRIVE_FIXED = 3
@@ -69,27 +67,6 @@ def parse_clip_name(name: str) -> Optional[tuple[str, _dt.datetime, str, str]]:
     return ts_key, ts_dt, channel, m.group("type").upper()
 
 
-def fingerprint(path: Path) -> tuple[Optional[str], Optional[str]]:
-    """A cheap identity for a clip: the first and last megabyte, hashed.
-
-    Reading a whole 200 MB clip to notice it is the same file we already have
-    would make re-inserting a card slow for no gain; the ends plus the size are
-    enough to catch a truncated or replaced file.
-    """
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as f:
-            head = hashlib.sha1(f.read(FINGERPRINT_BYTES)).hexdigest()
-            if size > FINGERPRINT_BYTES:
-                f.seek(max(0, size - FINGERPRINT_BYTES))
-                tail = hashlib.sha1(f.read(FINGERPRINT_BYTES)).hexdigest()
-            else:
-                tail = head
-        return head, tail
-    except OSError:
-        return None, None
-
-
 def read_serial(path: Path, known: Iterable[str] = ()) -> Optional[str]:
     """The camera serial recorded inside a clip.
 
@@ -121,12 +98,11 @@ class Source(Protocol):
 
     kind: str           # sdcard | folder | wifi
     key: str            # which card, which folder, which camera
-    erase_semantics: str  # "safe_to_erase" once copied, or "leave_alone"
+    erase_semantics: str  # "safe_to_erase" once everything on it is in the database, or "leave_alone"
 
     def is_present(self) -> bool: ...
     def identify(self, known_serials: Iterable[str] = ()) -> Optional[str]: ...
     def list_clips(self) -> list[ClipRef]: ...
-    def acquire(self, clip: ClipRef, dest: Path) -> Path: ...
 
 
 class _FileSource:
@@ -192,35 +168,12 @@ class _FileSource:
                 return serial
         return None
 
-    def acquire(self, clip: ClipRef, dest: Path) -> Path:
-        """Copy one clip, and only rename it into place once it is whole.
-
-        The copy lands as ``<name>.partial`` first, so a card pulled mid-copy
-        leaves an obviously incomplete file rather than a short clip that looks
-        finished.
-        """
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        final = dest if dest.suffix.lower() == ".mp4" else dest / clip.name
-        partial = final.with_name(final.name + ".partial")
-        if partial.exists():
-            partial.unlink()
-
-        shutil.copyfile(clip.path, partial)
-        copied = partial.stat().st_size
-        if copied != clip.size_bytes:
-            partial.unlink(missing_ok=True)
-            raise IOError(
-                f"{clip.name}: copied {copied} bytes but the source has {clip.size_bytes}"
-            )
-        partial.replace(final)
-        return final
-
 
 class FolderSource(_FileSource):
     """A plain folder of clips already on this machine.
 
-    Used for the backlog dumps, and for re-processing something by hand. Nothing
-    is ever deleted from it.
+    Used for backlog dumps, and for re-processing something by hand. Nothing is
+    ever written to it or deleted from it.
     """
 
     kind = "folder"
@@ -230,8 +183,9 @@ class FolderSource(_FileSource):
 class SdCardSource(_FileSource):
     """A camera card in a reader.
 
-    Read-only, always: the pipeline copies what is new and then says the card is
-    safe to erase, leaving the erasing to a person (or to the camera).
+    Read-only, always: the pipeline processes what is new straight off it and
+    says when the card is safe to erase, leaving the erasing to a person (or to
+    the camera).
     """
 
     kind = "sdcard"

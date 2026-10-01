@@ -51,7 +51,6 @@ class Config:
     path: Path
 
     state_dir: Path
-    staging_dir: Path
     trash_dir: Path
     keep_dirs: list[Path]
     exclude_volumes: list[str]
@@ -116,7 +115,7 @@ class Config:
 
     def ensure_dirs(self) -> None:
         """Create the folders the pipeline writes to."""
-        for d in (self.state_dir, self.staging_dir, self.log_dir, self.holding_path):
+        for d in (self.state_dir, self.log_dir, self.holding_path):
             d.mkdir(parents=True, exist_ok=True)
 
 
@@ -146,7 +145,6 @@ def load(path: Optional[str | Path] = None) -> Config:
     ntfy = raw.get("ntfy") or {}
 
     state_dir = expand(_require(paths, "state_dir", "[paths]"))
-    staging_dir = expand(paths.get("staging_dir") or (state_dir / "staging"))
 
     vehicles = []
     for entry in raw.get("vehicles") or []:
@@ -186,7 +184,6 @@ def load(path: Optional[str | Path] = None) -> Config:
     cfg = Config(
         path=config_path,
         state_dir=state_dir,
-        staging_dir=staging_dir,
         trash_dir=expand(paths.get("trash_dir") or (state_dir / "trash")),
         keep_dirs=[expand(p) for p in (paths.get("keep_dirs") or [])],
         exclude_volumes=[str(v).rstrip("\\").upper() for v in (paths.get("exclude_volumes") or [])],
@@ -218,7 +215,12 @@ def check(cfg: Config) -> list[str]:
     """
     problems: list[str] = []
 
-    for name in ("blackclue", "ffmpeg"):
+    # ffmpeg is always needed. blackclue only when the configuration asks for
+    # the external telemetry reader; by default telemetry is read in-process.
+    needed = ["ffmpeg"]
+    if str(cfg.processing.get("telemetry_reader") or "builtin") == "blackclue":
+        needed.append("blackclue")
+    for name in needed:
         value = cfg.tools.get(name)
         if not value:
             problems.append(f"[tools] does not say where {name} is")

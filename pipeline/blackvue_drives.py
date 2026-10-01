@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -85,7 +86,7 @@ DEFAULT_DERIVED_PARAMS: Dict[str, object] = {
 # and clip-accurate still timestamps, so the automated pipeline can re-run the
 # script safely and land correct times in the database.
 
-SCRIPT_VERSION = "61.0"
+SCRIPT_VERSION = "62.0"
 
 # Both cameras run on a fixed offset from UTC with no daylight saving, so clip
 # filenames and the bracketed RTC milliseconds in the NMEA sidecars are camera
@@ -1776,47 +1777,125 @@ def run_ffmpeg_timelapse(
         raise RuntimeError(f"ffmpeg timelapse failed (exit {rc}) for output: {out_mp4}")
 
 
+def still_schedule(
+    segments: Sequence[ClipSegment],
+    every_seconds: float,
+    max_frames: int = 0,
+    *,
+    end_margin_s: float = 0.5,
+) -> List[Tuple[int, Path, float]]:
+    """Which frame to take from which clip: (still number, clip, seconds into it).
+
+    Still n sits at (n-1) * every_seconds on the stitched timeline, which is
+    exactly where rename_stills_with_timestamps expects to find it, and is then
+    located inside its own clip so the frame really is from that moment. A tick
+    that lands in a clip's final half-second is pulled back a little, because
+    there may be no frame left to decode there.
+    """
+    if not segments or every_seconds <= 0:
+        return []
+    total = segments[-1].concat_start_s + segments[-1].duration_s
+    out: List[Tuple[int, Path, float]] = []
+    n = 1
+    while True:
+        t = (n - 1) * float(every_seconds)
+        if t >= total - 1e-6:
+            break
+        seg, within = segment_for_concat_offset(segments, t)
+        if seg is None:
+            break
+        within = min(within, max(0.0, seg.duration_s - end_margin_s))
+        out.append((n, seg.path, within))
+        if max_frames and len(out) >= int(max_frames):
+            break
+        n += 1
+    return out
+
+
 def run_ffmpeg_stills(
     *,
     ffmpeg_exe: str,
-    hwaccel: str | None,
-    prefer_mp4: Optional[Path],
-    list_file: Path,
+    segments: Sequence[ClipSegment],
     out_dir: Path,
     every_seconds: float,
     width: int,
     fmt: str,
     jpg_quality: int,
     max_frames: int,
+    jobs: int = 4,
     dry_run: bool,
     verbose: bool,
-) -> None:
-    if not dry_run:
-        out_dir.mkdir(parents=True, exist_ok=True)
+) -> int:
+    """One frame every N seconds, each seeked straight out of its own clip.
 
-    vf_parts: List[str] = [f"fps=1/{every_seconds:g}"]
-    if width and width > 0:
-        vf_parts.append(f"scale={int(width)}:-2")
-    vf = ",".join(vf_parts)
+    This used to decode every frame of the whole drive through ffmpeg's fps
+    filter and keep one in nine hundred. That was 97% of a drive's build time,
+    and the filter keeps the *last* frame of each window rather than the first,
+    so every still was about fifteen seconds later than the time written against
+    it. Seeking reads a few megabytes per still, decodes at most a second of
+    video, lands on the exact moment, and needs nothing but the clip itself,
+    which is what lets stills be taken straight off the card.
 
+    Returns how many stills were written.
+    """
     ext = (fmt or "jpg").lower().strip()
     if ext not in ("jpg", "png"):
         raise ValueError(f"Unsupported stills format: {fmt!r} (use jpg or png)")
 
-    pattern = out_dir / f"%06d.{ext}"
+    plan = still_schedule(segments, float(every_seconds), int(max_frames or 0))
+    if dry_run:
+        print(f"[DRY] Would extract {len(plan)} still(s) into {out_dir}")
+        return len(plan)
+    if not plan:
+        return 0
 
-    cmd: List[str] = [ffmpeg_exe, "-hide_banner", "-y", *(_ffmpeg_hwaccel_args(hwaccel)), *(_ffmpeg_input_args(prefer_mp4=prefer_mp4, list_file=list_file))]
-    cmd += ["-an", "-vf", vf, "-vsync", "vfr"]
-    if max_frames and int(max_frames) > 0:
-        cmd += ["-frames:v", str(int(max_frames))]
-    if ext == "jpg":
-        q = max(2, min(31, int(jpg_quality)))
-        cmd += ["-q:v", str(q)]
-    cmd += [str(pattern)]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vf = f"scale={int(width)}:-2" if width and width > 0 else None
+    q = max(2, min(31, int(jpg_quality)))
 
-    rc = run_subprocess(cmd, dry_run=dry_run, verbose=verbose)
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg still extraction failed (exit {rc}) into: {out_dir}")
+    def one(item: Tuple[int, Path, float]) -> Optional[Tuple[str, str]]:
+        n, clip, within = item
+        target = out_dir / f"{n:06d}.{ext}"
+        err = ""
+        # A second try a little earlier covers a clip that ends sooner than its
+        # measured length suggests; beyond that, the clip is the problem.
+        for seek in (within, max(0.0, within - 1.0)):
+            cmd: List[str] = [
+                ffmpeg_exe, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-ss", f"{seek:.3f}", "-i", str(clip), "-frames:v", "1", "-an",
+            ]
+            if vf:
+                cmd += ["-vf", vf]
+            if ext == "jpg":
+                cmd += ["-q:v", str(q)]
+            cmd += ["-update", "1", str(target)]
+            if verbose:
+                print("    " + " ".join(cmd))
+            done = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            if done.returncode == 0 and target.exists() and target.stat().st_size > 0:
+                return None
+            err = (done.stderr or "").strip()[-200:] or f"ffmpeg exit {done.returncode}"
+            if seek == 0.0:
+                break
+        return (clip.name, err)
+
+    failures: List[Tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as ex:
+        for res in ex.map(one, plan):
+            if res is not None:
+                failures.append(res)
+
+    if failures:
+        # A couple of unreadable moments should not cost the drive; a lot of
+        # them means the clips themselves cannot be read.
+        if len(failures) > max(2, len(plan) // 10):
+            raise RuntimeError(
+                f"{len(failures)} of {len(plan)} stills could not be extracted; "
+                f"first: {failures[0][0]}: {failures[0][1]}"
+            )
+        for name, err in failures:
+            eprint(f"  [WARN] no still from {name}: {err}")
+    return len(plan) - len(failures)
 
 def _parse_iso_z_dt(s: str) -> Optional[_dt.datetime]:
     s = (s or "").strip()
@@ -2519,6 +2598,133 @@ def extract_event_stills(
         if verbose:
             print("    " + " ".join(cmd))
         subprocess.run(cmd, check=False)
+# --- The camera's embedded telemetry ------------------------------------------
+# A BlackVue clip starts with a small `free` atom (about half a megabyte, at
+# byte 24) holding the GPS sentences, the accelerometer samples and a tiny
+# preview JPEG, each in a length-prefixed block tagged with a four-byte name.
+# Reading that block is all the telemetry extraction there is; the video that
+# follows is never touched. The blackclue tool does the same thing, and the
+# files written here hold what it would write, so nothing downstream changes.
+# Doing it in-process means nothing is written next to the source clip, which
+# is what makes it safe to read straight off the card.
+
+#: A `free` atom bigger than this is padding, not telemetry.
+EMBEDDED_FREE_ATOM_MAX_BYTES = 16 * 1024 * 1024
+
+#: block tag -> (where the payload starts within the block, what ends it, suffix)
+EMBEDDED_BLOCKS: Dict[bytes, Tuple[int, bytes, str]] = {
+    b"gps ": (4, b"\x00", ".nmea"),
+    b"3gf ": (4, b"\xff" * 10, ".3gf"),
+}
+
+#: The accelerometer stream ends at a sample whose time is all ones.
+ACCEL_END_MARK = 0xFFFFFFFF
+
+
+def iter_embedded_blocks(data: bytes) -> List[Tuple[bytes, bytes]]:
+    """Split the telemetry atom into (tag, block) pairs.
+
+    Each block is a big-endian length (counting itself), a four-byte tag and
+    the payload. A zero or impossible length ends the list.
+    """
+    out: List[Tuple[bytes, bytes]] = []
+    idx = 0
+    while idx + 8 <= len(data):
+        block_len = int.from_bytes(data[idx:idx + 4], "big")
+        if block_len < 8:
+            break
+        block = data[idx + 4: idx + block_len]
+        out.append((block[:4], block))
+        idx += block_len
+    return out
+
+
+def read_embedded_data(mp4: Path) -> Optional[bytes]:
+    """The clip's telemetry atom, or None when the clip has none.
+
+    Walks the top-level atoms by their headers and stops at the video (`mdat`),
+    so at most a few hundred kilobytes are read however large the clip is.
+    """
+    size_total = mp4.stat().st_size
+    with mp4.open("rb") as f:
+        pos = 0
+        while pos + 8 <= size_total:
+            f.seek(pos)
+            header = f.read(8)
+            if len(header) < 8:
+                break
+            size, kind = struct.unpack(">I4s", header)
+            header_len = 8
+            if size == 1:
+                size = struct.unpack(">Q", f.read(8))[0]
+                header_len = 16
+            elif size == 0:
+                size = size_total - pos
+            if size < header_len:
+                break
+            if kind == b"free" and size - header_len <= EMBEDDED_FREE_ATOM_MAX_BYTES:
+                data = f.read(size - header_len)
+                if any(tag in EMBEDDED_BLOCKS for tag, _ in iter_embedded_blocks(data)):
+                    return data
+            if kind == b"mdat":
+                break
+            pos += size
+    return None
+
+
+def format_accel_samples(payload: bytes) -> str:
+    """Decode the 10-byte accelerometer records into blackclue's .3gf.txt lines.
+
+    Each record is a 32-bit time in milliseconds and three 16-bit axis values.
+    The line layout (index, hex time, hex axes, then the same in decimal with
+    the axes signed) is what parse_3gf_txt reads.
+    """
+    lines: List[str] = []
+    n = 0
+    for off in range(0, len(payload) - 9, 10):
+        chunk = payload[off:off + 10]
+        t_ms = int.from_bytes(chunk[0:4], "big")
+        if t_ms == ACCEL_END_MARK:
+            break
+        u1, u2, u3 = struct.unpack(">HHH", chunk[4:10])
+        s1, s2, s3 = struct.unpack(">hhh", chunk[4:10])
+        lines.append(f"{n:8d} {t_ms:08x} {u1:04x} {u2:04x} {u3:04x} {t_ms:6d} {s1:6d} {s2:6d} {s3:6d}")
+        n += 1
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def extract_embedded_telemetry(mp4: Path, dest_dir: Path) -> Dict[str, Path]:
+    """Write one clip's GPS and accelerometer sidecars into dest_dir.
+
+    Produces <stem>.nmea, <stem>.3gf and <stem>.3gf.txt, named and laid out as
+    blackclue would have, so stitching and the accelerometer timeline read them
+    unchanged. Returns the files written, keyed by suffix; a clip with no
+    telemetry at all yields an empty dict rather than an error.
+    """
+    data = read_embedded_data(mp4)
+    written: Dict[str, Path] = {}
+    if data is None:
+        return written
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for tag, block in iter_embedded_blocks(data):
+        spec = EMBEDDED_BLOCKS.get(tag)
+        if spec is None:
+            continue
+        first, terminator, suffix = spec
+        last = block.find(terminator)
+        if last < 0:
+            last = len(block)
+        payload = block[first:last]
+        path = dest_dir / f"{mp4.stem}{suffix}"
+        path.write_bytes(payload)
+        written[suffix] = path
+        if suffix == ".3gf":
+            txt = dest_dir / f"{mp4.stem}.3gf.txt"
+            txt.write_text(format_accel_samples(payload), encoding="ascii", newline="\n")
+            written[".3gf.txt"] = txt
+    return written
+
+
 def collect_sidecars(mp4: Path) -> List[Path]:
     """
     blackclue typically produces files adjacent to the MP4:
@@ -3388,6 +3594,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="Write artifacts/thumbs/index.geojson with a GPS point per still (requires stitched per-drive .nmea; best with --stills-name utc or --stills-index).")
     ap.add_argument("--stills-view", choices=("front","rear","both"), default="front",
                     help="Which view(s) to extract stills for (default: front)")
+    ap.add_argument("--stills-jobs", type=int, default=4,
+                    help="How many stills to extract at once, one ffmpeg each (default: 4)")
 
 
     # event extraction (derived from stitched NMEA; optional)
@@ -3419,17 +3627,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--resolve-audio-bitrate-kbps", type=int, default=192)
 
     # blackclue / telemetry
-    ap.add_argument("--run-blackclue", action="store_true", help="Run blackclue extraction")
+    ap.add_argument("--run-blackclue", action="store_true",
+                    help="Extract GPS and accelerometer telemetry from each clip (the name is "
+                         "historical: see --telemetry-reader for how it is read).")
     ap.add_argument("--blackclue", default="blackclue", help="blackclue executable or path")
     ap.add_argument("--blackclue-mode", choices=("complete", "raw", "both"), default="raw")
     ap.add_argument("--blackclue-view", choices=("front", "rear", "both"), default="front")
+    ap.add_argument(
+        "--telemetry-reader", choices=("builtin", "blackclue"), default="builtin",
+        help=(
+            "How telemetry is read out of a clip. builtin (default) reads the clip's embedded "
+            "data block in-process and writes nothing beside the clip, so clips can be read "
+            "straight off a card; blackclue runs the external tool, which writes sidecars next "
+            "to the clip (--blackclue, --blackclue-mode and --telemetry-sidecar-action apply)."
+        ),
+    )
     ap.add_argument(
         "--blackclue-jobs",
         type=int,
         default=1,
         help=(
-            "Parallel jobs for per-clip blackclue extraction (default: 1). "
-            "Increase to speed up telemetry extraction."
+            "How many clips to read telemetry from at once (default: 1)."
         ),
     )
     ap.add_argument("--telemetry-sidecar-action", choices=("none", "copy", "move"), default="none",
@@ -3666,7 +3884,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     need_ffmpeg = bool(args.run_ffmpeg or args.compose_preview or args.emit_timelapse or args.emit_stills)
     ffmpeg_exe = which_or_fail(args.ffmpeg) if need_ffmpeg else None
-    blackclue_exe = which_or_fail(args.blackclue) if args.run_blackclue else None
+    blackclue_exe = (
+        which_or_fail(args.blackclue)
+        if (args.run_blackclue and args.telemetry_reader == "blackclue") else None
+    )
 
     # NVENC file-size matching: optional global target bitrate derived from a reference file.
     nvenc_target_mbps_global: float | None = args.nvenc_target_mbps
@@ -3878,6 +4099,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 modes = ["complete", "raw"] if args.blackclue_mode == "both" else [args.blackclue_mode]
 
                 def one_clip(mp4: Path) -> Optional[Path]:
+                    if args.telemetry_reader == "builtin":
+                        # Read the clip's own telemetry block; nothing is written
+                        # beside the clip, so this is safe on a card.
+                        if args.dry_run:
+                            print(f"[DRY] Would read embedded telemetry from {mp4.name}")
+                            return None
+                        try:
+                            written = extract_embedded_telemetry(mp4, tele_clips_dir)
+                        except Exception as exc:
+                            eprint(f"  [WARN] could not read telemetry from {mp4.name}: {exc}")
+                            failed_clips.append((mp4, str(exc)))
+                            return None
+                        return written.get(".nmea")
+
                     try:
                         for m in modes:
                             run_blackclue(blackclue_exe, m, mp4, dry_run=args.dry_run, verbose=args.verbose)
@@ -4164,29 +4399,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 def do_stills(view: str) -> None:
                     if view == "rear" and (args.front_only or not rear_paths):
                         return
-                    list_file = front_list if view == "front" else rear_list
-                    prefer_mp4 = prefer_front if view == "front" else prefer_rear
 
                     if args.output_layout == "import":
                         out_dir = tele_dir / "artifacts" / "thumbs"
                     else:
                         out_dir = preview_dir / f"{view}_frames_{itag}s"
 
-                    print(f"  stills {view} -> {out_dir.relative_to(output)}")
-                    run_ffmpeg_stills(
+                    # Each still is seeked out of its own clip, on the same
+                    # measured clip timeline the manifest and the index use.
+                    n_stills = run_ffmpeg_stills(
                         ffmpeg_exe=ffmpeg_exe,
-                        hwaccel=str(args.ffmpeg_hwaccel),
-                        prefer_mp4=prefer_mp4,
-                        list_file=list_file,
+                        segments=(front_segments if view == "front" else rear_segments),
                         out_dir=out_dir,
                         every_seconds=float(args.stills_every_seconds),
                         width=int(args.stills_width),
                         fmt=str(args.stills_format),
                         jpg_quality=int(args.stills_quality),
                         max_frames=int(args.stills_max),
+                        jobs=int(args.stills_jobs),
                         dry_run=args.dry_run,
                         verbose=args.verbose,
                     )
+                    print(f"  stills {view} -> {out_dir.relative_to(output)} ({n_stills} frames)")
 
 
                     # Optionally rename stills with timestamps and write an index.csv for later synchronization.
