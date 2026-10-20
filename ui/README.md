@@ -5,6 +5,22 @@ on the server with `/api/` proxied to the FastAPI container and `/media/`
 proxied to its thumbnail mount (see `nginx.conf`). Nothing is compiled: edit a
 file, reload the page.
 
+Pages: `index.html` (one drive: map, stills filmstrip with playback, speed and
+accelerometer timeline, events), `overview.html` (every route on one map),
+`stats.html` (totals, trends, when the cars are driven, records, event
+hotspots), `imports.html`. The address bar carries the drive, the moment and
+the list filters, so any view can be shared as a link.
+
+Code layout: `js/<page>.js` is each page's entry point; `js/drives.js`
+(list + filters), `js/drawer.js`, `js/basemap.js`, `js/format.js`, `js/api.js`
+and `js/nav.js` are shared; `js/state.js` holds the loaded drive and the one
+cursor that the map, filmstrip and timeline follow. `css/app.css` is shared by
+every page, `css/layout.css` by the two map pages.
+
+Checking a page without a browser window: `scripts/headless_check.py` drives
+headless Edge over the DevTools protocol, runs JavaScript in the page (the
+map pages expose `window.__dashcam`), clicks, and takes screenshots.
+
 On the PC there is no nginx, so `scripts/dev_ui.py` stands in for it. It
 serves this folder on `http://localhost:8080/`, forwards `/api/` to an API of
 your choosing and `/media/` to the server's thumbnails, and disables caching so

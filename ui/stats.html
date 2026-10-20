@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dashcam Stats</title>
+
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+  <link rel="stylesheet" href="css/app.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+  <link rel="stylesheet" href="css/stats.css" />
+</head>
+<body>
+  <header></header>
+
+  <div class="stats-wrap">
+    <div class="controls">
+      <select id="vehicle" title="Vehicle"><option value="">All vehicles</option></select>
+      <select id="preset" title="Period"></select>
+      <span class="dates" id="dates" hidden>
+        <label>From <input type="date" id="from" /></label>
+        <label>To <input type="date" id="to" /></label>
+      </span>
+      <span class="spacer"></span>
+      <span class="small" id="range">—</span>
+    </div>
+
+    <div class="tiles" id="tiles"></div>
+
+    <div class="panels">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Over time</h2>
+          <div class="seg" id="metric">
+            <button type="button" data-m="miles" class="on">Miles</button>
+            <button type="button" data-m="hours">Hours</button>
+            <button type="button" data-m="drives">Drives</button>
+            <button type="button" data-m="events">Events</button>
+          </div>
+          <div class="seg" id="bucket">
+            <button type="button" data-b="month" class="on">Month</button>
+            <button type="button" data-b="week">Week</button>
+          </div>
+        </div>
+        <div id="trend" class="chart"></div>
+        <details class="table-view"><summary>Table</summary><div id="trendTable"></div></details>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>When the cars are on the road</h2><span class="small">minutes driven, by weekday and hour</span></div>
+        <div id="heat" class="chart"></div>
+        <details class="table-view"><summary>Table</summary><div id="heatTable"></div></details>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>Records</h2></div>
+        <div id="records" class="records"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Where events cluster</h2>
+          <div class="chips" id="hotChips"></div>
+        </div>
+        <div class="hotmap-wrap">
+          <div id="hotMap"></div>
+          <div class="legend" id="hotLegend"><span>few</span><span class="bar heat"></span><span>many</span></div>
+        </div>
+      </section>
+    </div>
+
+    <p class="note" id="note">
+      Hard brakes, hard accelerations and harsh turns are found by differencing the GPS speed once a second;
+      bumps are accelerometer spikes above a threshold set per drive. The counts are good for comparing drives
+      and periods with each other, not as a verdict on anyone's driving. Stills made before 13 October 2026
+      run about 15 seconds later than the time shown against them.
+    </p>
+  </div>
+
+  <script type="module" src="js/stats.js"></script>
+</body>
+</html>

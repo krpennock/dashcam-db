@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional, List
 
 import asyncpg
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import Depends, FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -568,6 +568,207 @@ async def nearest(session_id: str, ts: str):
         "gnss": dict(gnss) if gnss else None,
         "accel": dict(accel) if accel else None,
         "clip": dict(clip) if clip else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Statistics across drives. Everything reads drive_session + drive_summary
+# (one row per drive) and derived_event, so these stay cheap.
+
+_DRIVES_CTE = """
+    WITH d AS (
+      SELECT d.drive_session_id, d.vehicle_tag, d.start_ts_utc, d.end_ts_utc,
+             s.distance_mi, s.duration_s, s.moving_avg_speed_mph, s.max_speed_mph,
+             s.stops_count, s.hard_brake_count, s.hard_accel_count, s.harsh_turn_count, s.bump_count
+      FROM dashcam.drive_session d
+      LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
+      {where}
+    )
+"""
+
+
+def _stats_filter_params(
+    vehicle: Optional[str] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    min_distance_mi: Optional[float] = Query(None, ge=0),
+    min_duration_s: Optional[float] = Query(None, ge=0),
+    has_event: Optional[str] = None,
+    time_confidence: Optional[str] = None,
+    hour_from: Optional[int] = Query(None, ge=0, le=23),
+    hour_to: Optional[int] = Query(None, ge=0, le=23),
+    weekdays: Optional[str] = None,
+    bbox: Optional[str] = None,
+):
+    return _session_filters(
+        vehicle, after, before, min_distance_mi, min_duration_s, has_event,
+        time_confidence, hour_from, hour_to, weekdays, bbox,
+    )
+
+
+def _row(r):
+    return dict(r) if r else None
+
+
+@app.get("/stats/overview")
+async def stats_overview(filters=Depends(_stats_filter_params)):
+    """Totals, per-vehicle split and records for the drives that match."""
+    where, args = filters
+    cte = _DRIVES_CTE.format(where=where)
+    tz = f"${len(args) + 1}::text"
+
+    q_totals = cte + """
+    SELECT vehicle_tag,
+           count(*)::int AS drives,
+           sum(distance_mi) AS miles,
+           sum(duration_s) / 3600.0 AS hours,
+           sum(CASE WHEN moving_avg_speed_mph > 0 THEN distance_mi / moving_avg_speed_mph END) AS moving_hours,
+           max(max_speed_mph) AS max_speed_mph,
+           sum(stops_count)::int AS stop,
+           sum(hard_brake_count)::int AS hard_brake,
+           sum(hard_accel_count)::int AS hard_accel,
+           sum(harsh_turn_count)::int AS harsh_turn,
+           sum(bump_count)::int AS bump,
+           min(start_ts_utc) AS first_drive,
+           max(start_ts_utc) AS last_drive
+    FROM d
+    GROUP BY ROLLUP (vehicle_tag)
+    ORDER BY vehicle_tag NULLS LAST;
+    """
+    q_longest = cte + "SELECT drive_session_id::text, vehicle_tag, start_ts_utc, distance_mi, duration_s FROM d ORDER BY distance_mi DESC NULLS LAST LIMIT 1;"
+    q_fastest = cte + "SELECT drive_session_id::text, vehicle_tag, start_ts_utc, max_speed_mph FROM d ORDER BY max_speed_mph DESC NULLS LAST LIMIT 1;"
+    q_most_events = cte + """
+    SELECT drive_session_id::text, vehicle_tag, start_ts_utc,
+           (COALESCE(hard_brake_count,0) + COALESCE(hard_accel_count,0) + COALESCE(harsh_turn_count,0) + COALESCE(bump_count,0))::int AS events
+    FROM d ORDER BY events DESC NULLS LAST LIMIT 1;
+    """
+    q_biggest_day = cte + f"""
+    SELECT (start_ts_utc AT TIME ZONE {tz})::date::text AS day, sum(distance_mi) AS miles, count(*)::int AS drives
+    FROM d WHERE start_ts_utc IS NOT NULL
+    GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 1;
+    """
+
+    assert pool is not None
+    async with pool.acquire() as con:
+        totals = await con.fetch(q_totals, *args)
+        longest = await con.fetchrow(q_longest, *args)
+        fastest = await con.fetchrow(q_fastest, *args)
+        most_events = await con.fetchrow(q_most_events, *args)
+        biggest_day = await con.fetchrow(q_biggest_day, *args, LOCAL_TZ)
+
+    rows = [dict(r) for r in totals]
+    total = next((r for r in rows if r["vehicle_tag"] is None), None) or {"drives": 0}
+    return {
+        "total": total,
+        "by_vehicle": [r for r in rows if r["vehicle_tag"] is not None],
+        "records": {
+            "longest": _row(longest),
+            "fastest": _row(fastest),
+            "most_events": _row(most_events),
+            "biggest_day": _row(biggest_day),
+        },
+    }
+
+
+@app.get("/stats/series")
+async def stats_series(bucket: str = "month", filters=Depends(_stats_filter_params)):
+    """Drives, miles, hours and event counts per vehicle per local week or month."""
+    if bucket not in ("week", "month"):
+        raise HTTPException(status_code=400, detail="bucket must be week or month")
+    where, args = filters
+    q = _DRIVES_CTE.format(where=where) + f"""
+    SELECT date_trunc(${len(args) + 1}::text, start_ts_utc AT TIME ZONE ${len(args) + 2}::text)::date::text AS bucket,
+           vehicle_tag,
+           count(*)::int AS drives,
+           sum(distance_mi) AS miles,
+           sum(duration_s) / 3600.0 AS hours,
+           sum(stops_count)::int AS stop,
+           sum(hard_brake_count)::int AS hard_brake,
+           sum(hard_accel_count)::int AS hard_accel,
+           sum(harsh_turn_count)::int AS harsh_turn,
+           sum(bump_count)::int AS bump
+    FROM d
+    WHERE start_ts_utc IS NOT NULL
+    GROUP BY 1, 2
+    ORDER BY 1, 2;
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, *args, bucket, LOCAL_TZ)
+    return [dict(r) for r in rows]
+
+
+@app.get("/stats/heatmap")
+async def stats_heatmap(filters=Depends(_stats_filter_params)):
+    """Minutes driven by local weekday (1 = Monday) and hour of day, per vehicle.
+
+    Each drive's span is cut into the hour slots it crosses, so a drive from
+    7:40 to 8:10 adds 20 minutes to the 7 o'clock slot and 10 to the 8 o'clock.
+    """
+    where, args = filters
+    tz = f"${len(args) + 1}::text"
+    q = _DRIVES_CTE.format(where=where) + f"""
+    , spans AS (
+      SELECT drive_session_id, vehicle_tag,
+             start_ts_utc AT TIME ZONE {tz} AS s,
+             end_ts_utc   AT TIME ZONE {tz} AS e
+      FROM d
+      WHERE start_ts_utc IS NOT NULL AND end_ts_utc IS NOT NULL AND end_ts_utc > start_ts_utc
+    )
+    SELECT vehicle_tag,
+           EXTRACT(isodow FROM h)::int AS dow,
+           EXTRACT(hour FROM h)::int AS hour,
+           sum(EXTRACT(epoch FROM (LEAST(h + interval '1 hour', e) - GREATEST(h, s))) / 60.0) AS minutes,
+           count(DISTINCT drive_session_id)::int AS drives
+    FROM spans,
+         LATERAL generate_series(date_trunc('hour', s), e, interval '1 hour') AS h
+    GROUP BY 1, 2, 3
+    ORDER BY 1, 2, 3;
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, *args, LOCAL_TZ)
+    return [dict(r) for r in rows]
+
+
+@app.get("/events/hotspots")
+async def event_hotspots(
+    types: Optional[str] = None,
+    limit: int = Query(50000, ge=1, le=200000),
+    filters=Depends(_stats_filter_params),
+):
+    """Every located event in the matching drives, as GeoJSON points."""
+    where, args = filters
+    type_list: Optional[List[str]] = None
+    if types:
+        type_list = [t.strip() for t in types.split(",") if t.strip()] or None
+    n = len(args)
+    q = f"""
+    SELECT e.event_id::text, e.drive_session_id::text, e.ts_utc, e.event_type, e.severity, e.lat, e.lon
+    FROM dashcam.derived_event e
+    JOIN dashcam.drive_session d USING (drive_session_id)
+    LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
+    {where}{" AND " if where else " WHERE "}e.lat IS NOT NULL AND e.lon IS NOT NULL
+      AND (${n + 1}::text[] IS NULL OR e.event_type = ANY(${n + 1}::text[]))
+    ORDER BY e.ts_utc DESC
+    LIMIT ${n + 2};
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, *args, type_list, limit)
+    return {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [r["lon"], r["lat"]]},
+            "properties": {
+                "event_id": r["event_id"],
+                "drive_session_id": r["drive_session_id"],
+                "ts_utc": r["ts_utc"],
+                "event_type": r["event_type"],
+                "severity": r["severity"],
+            },
+        } for r in rows],
     }
 
 

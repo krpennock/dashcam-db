@@ -1,10 +1,11 @@
 // The header every page shares.
 
-export const VERSION = "v0.4";
+export const VERSION = "v0.5";
 
 const PAGES = [
   { id: "viewer", label: "Viewer", href: "index.html" },
   { id: "overview", label: "Overview", href: "overview.html" },
+  { id: "stats", label: "Stats", href: "stats.html" },
   { id: "imports", label: "Imports", href: "imports.html" },
 ];
 

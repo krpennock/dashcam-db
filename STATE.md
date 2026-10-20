@@ -1,3 +1,25 @@
+# Viewer (v0.5, 2026-10-20)
+
+The web UI under `ui/` is static files with no build step: `index.html` (drive
+replay: map, filmstrip, timeline), `overview.html` (every route on one map),
+`stats.html` (totals, trends, weekday/hour heatmap, records, event hotspots)
+and `imports.html`. Shared modules live in `ui/js/`, stylesheets in `ui/css/`.
+How to run it on the PC against the server, and how to deploy, is in
+[ui/README.md](ui/README.md). The API gained `/tracks`, `/stats/*` and
+`/events/hotspots`; migration 30 added `dashcam.drive_track`, kept current by
+`refresh_derived()`.
+
+# Windows watcher operations (updated 2026-10-13)
+
+The installed watcher and its task, executable, working directory, configuration,
+logs, ledger, processing script, card workflow, and restart/update commands are
+documented in [pipeline/README.md](pipeline/README.md#installed-windows-watcher-keith-pc).
+The watcher runs the direct-card implementation from `C:\dev\dashcam-db\pipeline`;
+the `card-direct` worktree is not its runtime checkout.
+
+The older server notes below are historical context, not current Windows watcher
+installation instructions.
+
 # Dashcam DB/App state (as of 2026-02-19)
 
 

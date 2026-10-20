@@ -122,8 +122,9 @@ async function loadTracks(params) {
   if (src) src.setData(data);
   if (map.getLayer(LINE)) map.setPaintProperty(LINE, "line-color", colorExpr());
   renderLegend();
+  // With an area filter on, the view is the filter: leave it where it is.
   const b = boundsOf(data.features);
-  if (b) map.fitBounds(b, { padding: 40, duration: 500 });
+  if (b && !params.bbox) map.fitBounds(b, { padding: 40, duration: 500 });
   selectedId = "";
   for (const id of [SEL, SEL_CASING]) if (map.getLayer(id)) map.setFilter(id, idFilter(""));
   setStrip(null);

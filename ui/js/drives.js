@@ -8,7 +8,7 @@ import { apiGet, toast } from "./api.js";
 import { fmtLocal, fmtUtc, fmtDurationShort, fmtMi, escapeHtml, localDayIso, localDateStr } from "./format.js";
 import { TYPE_ORDER, typeColor, typeLabel } from "./events.js";
 
-const PRESETS = [
+export const PRESETS = [
   ["all", "All time"], ["7d", "Last 7 days"], ["30d", "Last 30 days"],
   ["month", "This month"], ["year", "This year"], ["custom", "Custom dates"],
 ];
@@ -18,10 +18,12 @@ const COUNT_COLS = {
   stop: "stops_count", bump: "bump_count",
 };
 
-/** Colours for vehicles, in the order the API lists them. */
-export const VEHICLE_PALETTE = ["#4dabf7", "#ff8c42", "#69db7c", "#ffd166", "#da77f2", "#2ec4b6"];
+/** Colours for vehicles, in the order the API lists them: a fixed categorical
+ *  order validated for colour-vision safety on the dark surface. */
+export const VEHICLE_PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"];
 
-function presetDates(preset) {
+/** [from, to] local dates for a period preset; empty strings mean no bound. */
+export function presetDates(preset) {
   const today = localDateStr(0);
   switch (preset) {
     case "7d": return [localDateStr(-6), today];
