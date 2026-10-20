@@ -39,6 +39,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     media_base = "http://192.168.1.164:8000/media"
 
     def do_GET(self):
+        # The page asks for stills as /api/media/...; a local API has no media
+        # folder, so those go to the media host too.
+        if self.path.startswith("/api/media/"):
+            return self._proxy(self.media_base + self.path[len("/api/media"):])
         if self.path.startswith("/api/"):
             return self._proxy(self.api_base + self.path[len("/api"):])
         if self.path.startswith("/media/"):

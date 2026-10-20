@@ -19,6 +19,9 @@ const $ = id => document.getElementById(id);
 const state = new DriveState();
 const map = createMap("map");
 
+// For poking at the page from the console or a headless check.
+window.__dashcam = { map, state };
+
 initTrack(map, state);
 
 initStoryboard({
