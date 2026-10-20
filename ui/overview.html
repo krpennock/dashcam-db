@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dashcam Overview</title>
+
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+
+  <link rel="stylesheet" href="css/app.css" />
+  <link rel="stylesheet" href="css/layout.css" />
+</head>
+<body>
+  <header></header>
+
+  <div class="app" id="app">
+    <aside class="drawer" id="drawer">
+      <div class="drawer-tabs">
+        <button type="button" class="tab active" data-tab="drives">Drives</button>
+        <button type="button" class="drawer-collapse" id="drawerToggle" title="Hide the side panel">◀</button>
+      </div>
+      <section class="tab-panel active" id="tab-drives"></section>
+    </aside>
+
+    <button type="button" class="rail" id="drawerExpand" title="Show the side panel">▶</button>
+
+    <main class="main">
+      <div class="strip" id="overviewStrip"><span class="muted">Loading…</span></div>
+      <div class="map-wrap">
+        <div id="map"></div>
+        <div class="legend" id="vehicleLegend"></div>
+        <div class="map-tip" id="mapTip" hidden></div>
+      </div>
+    </main>
+  </div>
+
+  <script type="module" src="js/overview.js"></script>
+</body>
+</html>

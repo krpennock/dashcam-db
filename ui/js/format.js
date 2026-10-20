@@ -132,6 +132,23 @@ export function toPlotlyLocal(v) {
   return new Date(ms + zoneOffsetMs(ms)).toISOString().replace("T", " ").replace("Z", "");
 }
 
+/** Start of a local calendar day ("2026-10-19") as a UTC ISO string; `end` gives the start of the next day. */
+export function localDayIso(dateStr, { end = false } = {}) {
+  if (!dateStr) return null;
+  const asUtc = Date.parse(`${dateStr}T00:00:00Z`) + (end ? 86400000 : 0);
+  if (!Number.isFinite(asUtc)) return null;
+  const guess = asUtc - zoneOffsetMs(asUtc);
+  return new Date(asUtc - zoneOffsetMs(guess)).toISOString();
+}
+
+/** Today's local date as "YYYY-MM-DD", shifted by `days`. */
+export function localDateStr(days = 0) {
+  const ms = Date.now() + days * 86400000;
+  const p = dtf({ year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(ms));
+  const get = t => p.find(x => x.type === t).value;
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
 /** The instant a Plotly date-axis string ("2026-10-19 18:30:00.4") stands for. */
 export function fromPlotlyLocal(str) {
   if (str == null) return null;

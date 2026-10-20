@@ -11,6 +11,7 @@ import { initStoryboard } from "./storyboard.js";
 import { initEvents, TYPE_ORDER, typeColor, typeLabel } from "./events.js";
 import { initTimeline } from "./timeline.js";
 import { initDrives } from "./drives.js";
+import { initDrawer } from "./drawer.js";
 
 renderNav("viewer", "Dashcam Viewer");
 
@@ -47,36 +48,14 @@ initEvents({
 const timeline = initTimeline({ el: $("chart"), state });
 
 const drives = initDrives({
-  els: {
-    vehicle: $("vehicleFilter"), from: $("dateFrom"), to: $("dateTo"),
-    body: $("sessionTableBody"), table: document.querySelector(".session-table"), status: $("sessionStatus"),
-  },
+  root: $("tab-drives"),
   onSelect: sid => loadDrive(sid).catch(err => toast(err.message)),
+  getBounds: () => map.getBounds(),
+  onChange: () => scheduleUrlUpdate(),
 });
 
-// --- Drawer: tabs and collapse ---
-
-const app = $("app");
-const DRAWER_KEY = "dashcam.drawer";
-
-function setDrawer(open) {
-  app.classList.toggle("collapsed", !open);
-  try { localStorage.setItem(DRAWER_KEY, open ? "open" : "closed"); } catch { /* storage blocked */ }
-  requestAnimationFrame(() => { map.resize(); timeline.resize(); });
-}
-$("drawerToggle").addEventListener("click", () => setDrawer(false));
-$("drawerExpand").addEventListener("click", () => setDrawer(true));
-try { if (localStorage.getItem(DRAWER_KEY) === "closed") setDrawer(false); } catch { /* storage blocked */ }
-
-function showTab(name) {
-  for (const b of document.querySelectorAll(".drawer-tabs .tab")) b.classList.toggle("active", b.dataset.tab === name);
-  for (const p of document.querySelectorAll(".tab-panel")) p.classList.toggle("active", p.id === `tab-${name}`);
-}
-document.querySelector(".drawer-tabs").addEventListener("click", e => {
-  const b = e.target.closest(".tab[data-tab]");
-  if (b) showTab(b.dataset.tab);
-});
-state.addEventListener("eventselect", e => { if (e.detail.event) { setDrawer(true); showTab("events"); } });
+const drawer = initDrawer({ app: $("app"), onResize: () => { map.resize(); timeline.resize(); } });
+state.addEventListener("eventselect", e => { if (e.detail.event) { drawer.setOpen(true); drawer.showTab("events"); } });
 
 // --- Summary strip ---
 
@@ -152,18 +131,20 @@ function scheduleClipLookup(ms) {
   }, 300);
 }
 
-// Keep the address bar shareable: ?session=<id>&t=<moment>.
+// Keep the address bar shareable: ?session=<id>&t=<moment> plus the list filters.
 let urlTimer = null;
 function scheduleUrlUpdate() {
   if (urlTimer) clearTimeout(urlTimer);
   urlTimer = setTimeout(() => {
     urlTimer = null;
+    const p = drives.toQuery(new URLSearchParams());
     const sid = state.session?.drive_session_id;
-    if (!sid || state.cursorMs == null) return;
-    const p = new URLSearchParams();
-    p.set("session", sid);
-    p.set("t", fmtUtc(state.cursorMs));
-    history.replaceState(null, "", `?${p.toString()}`);
+    if (sid && state.cursorMs != null) {
+      p.set("session", sid);
+      p.set("t", fmtUtc(state.cursorMs));
+    }
+    const q = p.toString();
+    history.replaceState(null, "", q ? `?${q}` : location.pathname);
   }, 500);
 }
 
@@ -208,7 +189,7 @@ const params = new URLSearchParams(location.search);
 const initialSid = params.get("session");
 const initialT = toMs(params.get("t"));
 
-drives.init()
+drives.init(params)
   .then(() => {
     if (!initialSid) return;
     drives.highlight(initialSid);

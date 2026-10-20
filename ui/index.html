@@ -10,6 +10,7 @@
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 
   <link rel="stylesheet" href="css/app.css" />
+  <link rel="stylesheet" href="css/layout.css" />
   <link rel="stylesheet" href="css/viewer.css" />
 </head>
 <body>
@@ -23,29 +24,7 @@
         <button type="button" class="drawer-collapse" id="drawerToggle" title="Hide the side panel">◀</button>
       </div>
 
-      <section class="tab-panel active" id="tab-drives">
-        <div class="session-filters">
-          <label>Vehicle
-            <select id="vehicleFilter"><option value="">All</option></select>
-          </label>
-          <label>From <input type="date" id="dateFrom" /></label>
-          <label>To <input type="date" id="dateTo" /></label>
-        </div>
-        <div class="session-table-wrap grow">
-          <table class="session-table">
-            <thead>
-              <tr>
-                <th data-col="vehicle_tag">Veh</th>
-                <th data-col="start_ts_utc">Date</th>
-                <th data-col="duration_s">Time</th>
-                <th data-col="distance_mi">Dist</th>
-              </tr>
-            </thead>
-            <tbody id="sessionTableBody"></tbody>
-          </table>
-        </div>
-        <div class="session-status" id="sessionStatus">Loading&hellip;</div>
-      </section>
+      <section class="tab-panel active" id="tab-drives"></section>
 
       <section class="tab-panel" id="tab-events">
         <div class="chips" id="eventChips"></div>

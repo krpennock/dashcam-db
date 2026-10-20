@@ -4,6 +4,7 @@ export const VERSION = "v0.4";
 
 const PAGES = [
   { id: "viewer", label: "Viewer", href: "index.html" },
+  { id: "overview", label: "Overview", href: "overview.html" },
   { id: "imports", label: "Imports", href: "imports.html" },
 ];
 

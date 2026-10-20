@@ -10,6 +10,9 @@
   --danger: #ff6b6b;
 }
 
+/* The hidden attribute wins over any display rule below. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -84,6 +87,39 @@ a { color: var(--accent); }
 .session-table tbody tr:hover { background: rgba(255, 255, 255, 0.04); }
 .session-table tbody tr.active { background: rgba(100, 180, 255, 0.12); }
 .session-status { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+/* Chips: a small toggle with its own colour (--chip). */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  --chip: var(--muted);
+  border: 1px solid var(--chip); color: var(--chip); background: none;
+  border-radius: 999px; padding: 3px 10px; font-size: 11px; opacity: 0.45; cursor: pointer;
+}
+.chip.on { opacity: 1; background: color-mix(in srgb, var(--chip) 15%, transparent); }
+.chip .n { color: var(--text); margin-left: 4px; }
+
+/* Drive filters (drives.js renders these) */
+.drives-panel { display: flex; flex-direction: column; min-height: 0; gap: 8px; }
+.filters { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+.frow { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.frow select, .frow input[type="date"], .frow input[type="number"] { font-size: 12px; padding: 4px 7px; }
+.frow input[type="number"] { width: 44px; }
+.frow label { color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+.frow .check input { margin: 0; }
+.frow button.inview, .frow button.reset { font-size: 11px; padding: 4px 9px; border-radius: 8px; }
+.frow button.reset { margin-left: auto; color: var(--muted); }
+details.more summary { cursor: pointer; color: var(--muted); font-size: 11px; user-select: none; }
+details.more[open] summary { margin-bottom: 4px; }
+.wd { padding: 3px 7px; font-size: 11px; border-radius: 8px; color: var(--muted); opacity: 0.6; }
+.wd.on { color: var(--text); border-color: var(--accent); opacity: 1; }
+.drives-panel .session-table-wrap { overflow-x: hidden; }
+.drives-panel .session-table td { padding: 5px 6px; }
+.session-table td.evcol { white-space: nowrap; }
+.evd {
+  display: inline-block; min-width: 9px; padding: 0 3px; margin-right: 2px; border-radius: 999px;
+  font-size: 10px; line-height: 14px; color: #0b0f14; text-align: center; font-weight: 600;
+}
+.session-table .approx { color: #ffd166; font-weight: 700; }
 
 /* Messages */
 #toasts {

@@ -107,31 +107,206 @@ async def list_vehicles():
     return [r["vehicle_tag"] for r in rows]
 
 
+# Local time for "starts between 7 and 9 o'clock" style filters.
+LOCAL_TZ = "America/Chicago"
+
+EVENT_COUNT_COLS = {
+    "hard_brake": "s.hard_brake_count",
+    "hard_accel": "s.hard_accel_count",
+    "harsh_turn": "s.harsh_turn_count",
+    "stop": "s.stops_count",
+    "bump": "s.bump_count",
+}
+
+
+def _parse_bbox(bbox: Optional[str]) -> Optional[List[float]]:
+    if not bbox:
+        return None
+    try:
+        parts = [float(x) for x in bbox.split(",")]
+    except ValueError:
+        parts = []
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="bbox must be minLon,minLat,maxLon,maxLat")
+    return parts
+
+
+def _session_filters(
+    vehicle: Optional[str],
+    after: Optional[str],
+    before: Optional[str],
+    min_distance_mi: Optional[float],
+    min_duration_s: Optional[float],
+    has_event: Optional[str],
+    time_confidence: Optional[str],
+    hour_from: Optional[int],
+    hour_to: Optional[int],
+    weekdays: Optional[str],
+    bbox: Optional[str],
+):
+    """WHERE clause and arguments shared by /sessions and /tracks.
+
+    Expects the query to alias drive_session as d and drive_summary as s.
+    """
+    clauses: List[str] = []
+    args: list = []
+
+    def arg(value):
+        args.append(value)
+        return f"${len(args)}"
+
+    if vehicle:
+        clauses.append(f"d.vehicle_tag = {arg(vehicle)}::text")
+    after_ts = _parse_ts(after)
+    before_ts = _parse_ts(before)
+    if after_ts:
+        clauses.append(f"d.start_ts_utc >= {arg(after_ts)}::timestamptz")
+    if before_ts:
+        clauses.append(f"d.start_ts_utc <= {arg(before_ts)}::timestamptz")
+    if min_distance_mi is not None:
+        clauses.append(f"s.distance_mi >= {arg(float(min_distance_mi))}::float8")
+    if min_duration_s is not None:
+        clauses.append(f"s.duration_s >= {arg(float(min_duration_s))}::float8")
+
+    if has_event:
+        types = [t.strip() for t in has_event.split(",") if t.strip()]
+        unknown = [t for t in types if t not in EVENT_COUNT_COLS]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown event type(s): {', '.join(unknown)}")
+        if types:
+            # "Has any of": a drive with at least one event of a lit type.
+            clauses.append("(" + " OR ".join(f"{EVENT_COUNT_COLS[t]} > 0" for t in types) + ")")
+
+    if time_confidence == "approximate":
+        clauses.append("d.time_confidence LIKE 'filename%'")
+    elif time_confidence == "exact":
+        clauses.append("(d.time_confidence IS NULL OR d.time_confidence NOT LIKE 'filename%')")
+    elif time_confidence:
+        raise HTTPException(status_code=400, detail="time_confidence must be 'exact' or 'approximate'")
+
+    if hour_from is not None or hour_to is not None:
+        lo = hour_from if hour_from is not None else 0
+        hi = hour_to if hour_to is not None else 23
+        hour = f"EXTRACT(hour FROM (d.start_ts_utc AT TIME ZONE {arg(LOCAL_TZ)}::text))::int"
+        if lo <= hi:
+            clauses.append(f"{hour} BETWEEN {arg(lo)}::int AND {arg(hi)}::int")
+        else:
+            # A range such as 22 to 5 wraps past midnight.
+            clauses.append(f"({hour} >= {arg(lo)}::int OR {hour} <= {arg(hi)}::int)")
+
+    if weekdays:
+        try:
+            days = sorted({int(x) for x in weekdays.split(",") if x.strip()})
+        except ValueError:
+            raise HTTPException(status_code=400, detail="weekdays must be numbers 1 (Monday) to 7 (Sunday)")
+        if any(d < 1 or d > 7 for d in days):
+            raise HTTPException(status_code=400, detail="weekdays must be numbers 1 (Monday) to 7 (Sunday)")
+        if days:
+            clauses.append(
+                f"EXTRACT(isodow FROM (d.start_ts_utc AT TIME ZONE {arg(LOCAL_TZ)}::text))::int = ANY({arg(days)}::int[])"
+            )
+
+    bb = _parse_bbox(bbox)
+    if bb:
+        clauses.append(
+            "EXISTS (SELECT 1 FROM dashcam.drive_track t "
+            "WHERE t.drive_session_id = d.drive_session_id "
+            f"AND ST_Intersects(t.geom_line, ST_MakeEnvelope({arg(bb[0])}::float8, {arg(bb[1])}::float8, "
+            f"{arg(bb[2])}::float8, {arg(bb[3])}::float8, 4326)))"
+        )
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, args
+
+
 @app.get("/sessions")
 async def list_sessions(
     limit: int = Query(500, ge=1, le=5000),
     vehicle: Optional[str] = None,
     after: Optional[str] = None,
     before: Optional[str] = None,
+    min_distance_mi: Optional[float] = Query(None, ge=0),
+    min_duration_s: Optional[float] = Query(None, ge=0),
+    has_event: Optional[str] = None,       # comma-separated event types; any of them
+    time_confidence: Optional[str] = None, # exact | approximate
+    hour_from: Optional[int] = Query(None, ge=0, le=23),  # local start hour, inclusive
+    hour_to: Optional[int] = Query(None, ge=0, le=23),
+    weekdays: Optional[str] = None,        # comma-separated 1..7, Monday first
+    bbox: Optional[str] = None,            # minLon,minLat,maxLon,maxLat
 ):
-    after_ts = _parse_ts(after)
-    before_ts = _parse_ts(before)
-    q = """
+    where, args = _session_filters(
+        vehicle, after, before, min_distance_mi, min_duration_s, has_event,
+        time_confidence, hour_from, hour_to, weekdays, bbox,
+    )
+    q = f"""
     SELECT d.drive_session_id::text, d.vehicle_tag, d.start_ts_utc, d.end_ts_utc,
            d.drive_tag, d.time_confidence,
-           s.duration_s, s.distance_mi, s.max_speed_mph, s.avg_speed_mph
+           s.duration_s, s.distance_mi, s.max_speed_mph, s.avg_speed_mph,
+           s.stops_count, s.hard_brake_count, s.hard_accel_count, s.harsh_turn_count, s.bump_count
     FROM dashcam.drive_session d
     LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
-    WHERE ($1::text IS NULL OR d.vehicle_tag = $1)
-      AND ($2::timestamptz IS NULL OR d.start_ts_utc >= $2)
-      AND ($3::timestamptz IS NULL OR d.start_ts_utc <= $3)
+    {where}
     ORDER BY d.start_ts_utc DESC NULLS LAST
-    LIMIT $4;
+    LIMIT ${len(args) + 1};
     """
     assert pool is not None
     async with pool.acquire() as con:
-        rows = await con.fetch(q, vehicle, after_ts, before_ts, limit)
+        rows = await con.fetch(q, *args, limit)
     return [dict(r) for r in rows]
+
+
+@app.get("/tracks")
+async def list_tracks(
+    limit: int = Query(2000, ge=1, le=10000),
+    vehicle: Optional[str] = None,
+    after: Optional[str] = None,
+    before: Optional[str] = None,
+    min_distance_mi: Optional[float] = Query(None, ge=0),
+    min_duration_s: Optional[float] = Query(None, ge=0),
+    has_event: Optional[str] = None,
+    time_confidence: Optional[str] = None,
+    hour_from: Optional[int] = Query(None, ge=0, le=23),
+    hour_to: Optional[int] = Query(None, ge=0, le=23),
+    weekdays: Optional[str] = None,
+    bbox: Optional[str] = None,
+):
+    """Every matching drive's simplified route, as one GeoJSON FeatureCollection."""
+    where, args = _session_filters(
+        vehicle, after, before, min_distance_mi, min_duration_s, has_event,
+        time_confidence, hour_from, hour_to, weekdays, bbox,
+    )
+    q = f"""
+    SELECT d.drive_session_id::text, d.vehicle_tag, d.start_ts_utc, d.time_confidence,
+           s.distance_mi, s.duration_s, t.point_count,
+           ST_AsGeoJSON(t.geom_line) AS geojson
+    FROM dashcam.drive_track t
+    JOIN dashcam.drive_session d USING (drive_session_id)
+    LEFT JOIN dashcam.drive_summary s USING (drive_session_id)
+    {where}
+    ORDER BY d.start_ts_utc DESC NULLS LAST
+    LIMIT ${len(args) + 1};
+    """
+    assert pool is not None
+    async with pool.acquire() as con:
+        rows = await con.fetch(q, *args, limit)
+
+    features = []
+    for r in rows:
+        geom = r["geojson"]
+        features.append({
+            "type": "Feature",
+            "geometry": json.loads(geom) if isinstance(geom, str) else geom,
+            "properties": {
+                "drive_session_id": r["drive_session_id"],
+                "vehicle_tag": r["vehicle_tag"],
+                "start_ts_utc": r["start_ts_utc"],
+                "time_confidence": r["time_confidence"],
+                "distance_mi": r["distance_mi"],
+                "duration_s": r["duration_s"],
+                "point_count": r["point_count"],
+            },
+        })
+    return {"type": "FeatureCollection", "features": features}
 
 
 @app.get("/sessions/{session_id}")
