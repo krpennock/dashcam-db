@@ -1,5 +1,5 @@
-// The stills: clustered dots on the map, the thumbnail grid, and the preview
-// that follows the cursor.
+// The stills: a filmstrip with playback under the map, a picture-in-picture
+// of the current still on the map, hover previews, and clustered dots.
 
 import { onStyleReady, removeLayers, EMPTY_FC, LABEL_FONT } from "./basemap.js";
 import { mediaUrl } from "./api.js";
@@ -10,76 +10,70 @@ const CLUSTERS = "story-clusters";
 const COUNTS = "story-cluster-count";
 const POINTS = "story-points";
 
-/** Scroll `node` into view inside `container` without moving anything else on the page. */
-function scrollWithin(container, node) {
-  const top = node.offsetTop - container.offsetTop;
-  const bottom = top + node.offsetHeight;
-  if (top < container.scrollTop) container.scrollTop = top;
-  else if (bottom > container.scrollTop + container.clientHeight) container.scrollTop = bottom - container.clientHeight;
+const RATE_MS = { 1: 500, 2: 250, 4: 125 };
+
+function scrollIntoStrip(strip, node) {
+  const left = node.offsetLeft - strip.offsetLeft;
+  const right = left + node.offsetWidth;
+  const want = left - (strip.clientWidth - node.offsetWidth) / 2;
+  if (left < strip.scrollLeft || right > strip.scrollLeft + strip.clientWidth) {
+    strip.scrollTo({ left: Math.max(0, want), behavior: "smooth" });
+  }
 }
 
-export function initStoryboard({ map, state, els, onReload }) {
+export function initStoryboard({ map, state, els, track }) {
   let data = EMPTY_FC;
-  let popup = null;
   let activeIndex = -1;
+  let timer = null;
+
+  // --- Map dots ---
 
   const install = () => {
     removeLayers(map, [POINTS, COUNTS, CLUSTERS], SRC);
-    map.addSource(SRC, {
-      type: "geojson", data,
-      cluster: true, clusterRadius: 40, clusterMaxZoom: 15,
-    });
+    map.addSource(SRC, { type: "geojson", data, cluster: true, clusterRadius: 40, clusterMaxZoom: 15 });
     map.addLayer({
       id: CLUSTERS, type: "circle", source: SRC,
       filter: ["has", "point_count"],
       paint: {
-        "circle-color": "#365070",
-        "circle-opacity": 0.85,
-        "circle-stroke-width": 1,
-        "circle-stroke-color": "#9fb0c0",
+        "circle-color": "#365070", "circle-opacity": 0.85,
+        "circle-stroke-width": 1, "circle-stroke-color": "#9fb0c0",
         "circle-radius": ["step", ["get", "point_count"], 11, 10, 14, 50, 18],
       },
     });
     map.addLayer({
       id: COUNTS, type: "symbol", source: SRC,
       filter: ["has", "point_count"],
-      layout: {
-        "text-field": ["get", "point_count_abbreviated"],
-        "text-font": LABEL_FONT,
-        "text-size": 11,
-      },
+      layout: { "text-field": ["get", "point_count_abbreviated"], "text-font": LABEL_FONT, "text-size": 11 },
       paint: { "text-color": "#e6edf3" },
     });
     map.addLayer({
       id: POINTS, type: "circle", source: SRC,
       filter: ["!", ["has", "point_count"]],
       paint: {
-        "circle-radius": 4,
-        "circle-color": "#9fb0c0",
-        "circle-opacity": 0.9,
-        "circle-stroke-width": 1,
-        "circle-stroke-color": "#0b0f14",
+        "circle-radius": 4, "circle-color": "#9fb0c0", "circle-opacity": 0.9,
+        "circle-stroke-width": 1, "circle-stroke-color": "#0b0f14",
       },
     });
   };
   onStyleReady(map, install);
 
-  // Layer event handlers are keyed by layer id, so they survive the layer
-  // being removed and re-added on a basemap switch.
   map.on("click", CLUSTERS, e => {
     const f = e.features?.[0];
     const src = map.getSource(SRC);
     if (!f || !src) return;
     src.getClusterExpansionZoom(f.properties.cluster_id, (err, zoom) => {
-      if (err) return;
-      map.easeTo({ center: f.geometry.coordinates, zoom });
+      if (!err) map.easeTo({ center: f.geometry.coordinates, zoom });
     });
   });
   map.on("click", POINTS, e => {
     const f = e.features?.[0];
-    if (!f) return;
-    select(Number(f.properties.index), { popup: true });
+    if (f) select(Number(f.properties.index), "storyboard");
   });
+  map.on("mousemove", POINTS, e => {
+    const f = e.features?.[0];
+    if (f) showHover(Number(f.properties.index), e.point);
+  });
+  map.on("mouseleave", POINTS, hideHover);
   for (const id of [CLUSTERS, POINTS]) {
     map.on("mouseenter", id, () => { map.getCanvas().style.cursor = "pointer"; });
     map.on("mouseleave", id, () => { map.getCanvas().style.cursor = ""; });
@@ -91,85 +85,140 @@ export function initStoryboard({ map, state, els, onReload }) {
     if (src) src.setData(fc);
   }
 
-  function select(index, { popup: showPopup = false } = {}) {
-    const f = state.frames[index];
-    if (!f) return;
-    state.setCursor(state.frameMs[index], "storyboard");
-    if (showPopup) showPopupFor(f);
+  // --- Selection and playback ---
+
+  function select(index, source = "storyboard") {
+    if (index < 0 || index >= state.frames.length) return;
+    state.setCursor(state.frameMs[index], source);
   }
 
-  function showPopupFor(f) {
-    if (popup) { popup.remove(); popup = null; }
-    if (f.lon == null || f.lat == null || !f.url) return;
-    const html = `
-      <div class="story-popup">
-        <div class="t mono" title="${fmtUtc(f.ts_utc)}">${escapeHtml(fmtClock(f.ts_utc, { seconds: true }))}</div>
-        <div class="muted">${escapeHtml(fmtMph(f.speed_mph))}</div>
-        <img src="${mediaUrl(f.url)}" alt="" />
-      </div>`;
-    popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true, maxWidth: "270px" })
-      .setLngLat([f.lon, f.lat])
-      .setHTML(html)
-      .addTo(map);
-    map.easeTo({ center: [f.lon, f.lat], duration: 200 });
+  function step(delta) {
+    stop();
+    const base = activeIndex < 0 ? 0 : activeIndex;
+    select(Math.max(0, Math.min(state.frames.length - 1, base + delta)), "transport");
   }
 
-  function setPreview(f) {
-    if (!f?.url) {
-      els.previewEmpty.style.display = "block";
-      els.previewImg.style.display = "none";
-      els.previewImg.removeAttribute("src");
-      els.previewTs.textContent = "—";
-      els.previewTs.removeAttribute("title");
-      els.openLink.style.display = "none";
-      return;
+  function play() {
+    if (timer || !state.frames.length) return;
+    if (activeIndex >= state.frames.length - 1) select(0, "transport");
+    els.btnPlay.textContent = "❚❚";
+    els.btnPlay.title = "Pause (Space)";
+    const tick = () => {
+      const next = activeIndex + 1;
+      if (next >= state.frames.length) { stop(); return; }
+      select(next, "playback");
+      timer = setTimeout(tick, RATE_MS[els.rate.value] || 500);
+    };
+    timer = setTimeout(tick, RATE_MS[els.rate.value] || 500);
+  }
+
+  function stop() {
+    if (timer) { clearTimeout(timer); timer = null; }
+    els.btnPlay.textContent = "▶";
+    els.btnPlay.title = "Play (Space)";
+  }
+
+  function toggle() { if (timer) stop(); else play(); }
+
+  els.btnPlay.addEventListener("click", toggle);
+  els.btnPrev.addEventListener("click", () => step(-1));
+  els.btnNext.addEventListener("click", () => step(1));
+  els.btnFirst.addEventListener("click", () => { stop(); select(0, "transport"); });
+  els.btnLast.addEventListener("click", () => { stop(); select(state.frames.length - 1, "transport"); });
+
+  document.addEventListener("keydown", e => {
+    const tag = (e.target?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "select" || tag === "textarea") return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    switch (e.key) {
+      case " ": e.preventDefault(); toggle(); break;
+      case "ArrowLeft": e.preventDefault(); step(-1); break;
+      case "ArrowRight": e.preventDefault(); step(1); break;
+      case "Home": e.preventDefault(); stop(); select(0, "transport"); break;
+      case "End": e.preventDefault(); stop(); select(state.frames.length - 1, "transport"); break;
+      default: return;
     }
+  });
+
+  // --- Picture in picture ---
+
+  function setPip(f) {
+    if (!f?.url) { els.pip.hidden = true; return; }
     const url = mediaUrl(f.url);
-    els.previewEmpty.style.display = "none";
-    els.previewImg.style.display = "block";
-    if (els.previewImg.getAttribute("src") !== url) els.previewImg.src = url;
-    els.previewTs.textContent = `${fmtClock(f.ts_utc, { seconds: true })} · ${fmtMph(f.speed_mph)}`;
-    els.previewTs.title = fmtUtc(f.ts_utc);
-    els.openLink.style.display = "inline";
-    els.openLink.href = url;
+    els.pip.hidden = false;
+    if (els.pipImg.getAttribute("src") !== url) els.pipImg.src = url;
+    els.pipTime.textContent = fmtClock(f.ts_utc, { seconds: true });
+    els.pipTime.title = fmtUtc(f.ts_utc);
+    els.pipSpeed.textContent = fmtMph(f.speed_mph);
+    els.pipOpen.href = url;
   }
+
+  // --- Hover card (over the map) ---
+
+  function showHover(index, point) {
+    const f = state.frames[index];
+    if (!f?.url) { hideHover(); return; }
+    const url = mediaUrl(f.url);
+    if (els.hoverImg.getAttribute("src") !== url) els.hoverImg.src = url;
+    els.hoverCap.textContent = `${fmtClock(f.ts_utc, { seconds: true })} · ${fmtMph(f.speed_mph)}`;
+    els.hoverCard.hidden = false;
+    const box = els.hoverCard.parentElement.getBoundingClientRect();
+    const w = els.hoverCard.offsetWidth || 260, h = els.hoverCard.offsetHeight || 180;
+    let x = point.x + 16, y = point.y + 16;
+    if (x + w > box.width - 8) x = point.x - w - 16;
+    if (y + h > box.height - 8) y = point.y - h - 16;
+    els.hoverCard.style.transform = `translate(${Math.max(0, x)}px, ${Math.max(0, y)}px)`;
+  }
+
+  function hideHover() { els.hoverCard.hidden = true; }
+
+  /** For the route: the still nearest a moment, shown at a map pixel. */
+  function hoverAt(ms, point) {
+    const i = state.nearestFrameIndex(ms);
+    if (i >= 0) showHover(i, point);
+  }
+
+  // --- Filmstrip ---
 
   function highlight(index) {
     if (index === activeIndex) return;
-    els.grid.querySelector(".thumb.active")?.classList.remove("active");
-    const node = els.grid.children[index];
+    els.strip.querySelector(".frame.active")?.classList.remove("active");
+    const node = els.strip.children[index];
     if (node) {
       node.classList.add("active");
-      scrollWithin(els.grid, node);
+      scrollIntoStrip(els.strip, node);
     }
     activeIndex = index;
   }
 
-  function renderGrid() {
-    els.grid.innerHTML = state.frames.map((f, i) => `
-      <div class="thumb" data-index="${i}">
+  function renderStrip() {
+    els.strip.innerHTML = state.frames.map((f, i) => `
+      <div class="frame" data-index="${i}" title="${fmtUtc(f.ts_utc)}">
         <img loading="lazy" src="${mediaUrl(f.url)}" alt="" />
-        <div class="cap" title="${fmtUtc(f.ts_utc)}">${escapeHtml(fmtClock(f.ts_utc, { seconds: true }))}</div>
+        <div class="cap">${escapeHtml(fmtClock(f.ts_utc, { seconds: true }))}</div>
       </div>`).join("");
   }
 
-  els.grid.addEventListener("click", e => {
-    const node = e.target.closest(".thumb[data-index]");
-    if (!node) return;
-    select(Number(node.dataset.index), { popup: true });
+  els.strip.addEventListener("click", e => {
+    const node = e.target.closest(".frame[data-index]");
+    if (node) { stop(); select(Number(node.dataset.index), "filmstrip"); }
   });
+  els.strip.addEventListener("mouseover", e => {
+    const node = e.target.closest(".frame[data-index]");
+    if (!node) return;
+    const f = state.frames[Number(node.dataset.index)];
+    if (f) track.setRing(f.lon, f.lat);
+  });
+  els.strip.addEventListener("mouseleave", () => track.setRing(null, null));
 
-  if (els.reloadBtn && onReload) {
-    els.reloadBtn.addEventListener("click", () => onReload());
-  }
+  // --- State ---
 
   state.addEventListener("load", () => {
+    stop();
     activeIndex = -1;
     const n = state.frames.length;
-    els.count.textContent = `(${n})`;
-    els.status.textContent = n ? "loaded" : "no storyboard frames for this session";
-    if (els.reloadBtn) els.reloadBtn.disabled = false;
-    renderGrid();
+    els.count.textContent = n ? `${n} stills` : "no stills";
+    renderStrip();
     setData({
       type: "FeatureCollection",
       features: state.frames
@@ -181,27 +230,27 @@ export function initStoryboard({ map, state, els, onReload }) {
           properties: { index: i },
         })),
     });
-    setPreview(state.frames[0] || null);
-    if (n) highlight(0);
+    for (const b of [els.btnPlay, els.btnPrev, els.btnNext, els.btnFirst, els.btnLast]) b.disabled = !n;
+    setPip(null);
   });
 
   state.addEventListener("clear", () => {
-    if (popup) { popup.remove(); popup = null; }
+    stop();
     activeIndex = -1;
     setData(EMPTY_FC);
-    els.grid.innerHTML = "";
+    els.strip.innerHTML = "";
     els.count.textContent = "—";
-    els.status.textContent = "—";
-    if (els.reloadBtn) els.reloadBtn.disabled = true;
-    setPreview(null);
+    setPip(null);
+    hideHover();
+    for (const b of [els.btnPlay, els.btnPrev, els.btnNext, els.btnFirst, els.btnLast]) b.disabled = true;
   });
 
   state.addEventListener("cursorchange", e => {
     const i = state.nearestFrameIndex(e.detail.ms);
     if (i < 0) return;
     highlight(i);
-    setPreview(state.frames[i]);
+    setPip(state.frames[i]);
   });
 
-  return { select };
+  return { select, hoverAt, hideHover, stop };
 }

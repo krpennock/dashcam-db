@@ -29,10 +29,12 @@ export function nearestIndex(arr, x) {
 export class DriveState extends EventTarget {
   constructor() {
     super();
+    this.hiddenTypes = new Set(); // survives a drive change on purpose
     this._reset();
   }
 
   _reset() {
+    this.selectedEvent = null;
     this.session = null;
     this.summary = null;
     this.gnss = []; this.gnssMs = [];
@@ -96,5 +98,35 @@ export class DriveState extends EventTarget {
   nearestFrame(ms) {
     const i = this.nearestFrameIndex(ms);
     return i < 0 ? null : this.frames[i];
+  }
+
+  /** Index of the last frame at or before a moment, or -1. */
+  frameIndexBefore(ms) {
+    return lowerBound(this.frameMs, ms + 1) - 1;
+  }
+
+  /** Index of the first frame at or after a moment, or -1 when none. */
+  frameIndexAfter(ms) {
+    const i = lowerBound(this.frameMs, ms);
+    return i < this.frameMs.length ? i : -1;
+  }
+
+  // --- Which event types are shown (list, map and timeline follow together) ---
+
+  isTypeVisible(t) { return !this.hiddenTypes.has(t); }
+
+  setTypeVisible(t, visible) {
+    if (visible) this.hiddenTypes.delete(t); else this.hiddenTypes.add(t);
+    this.dispatchEvent(new CustomEvent("eventfilter"));
+  }
+
+  visibleEvents() {
+    return this.events.filter(e => !this.hiddenTypes.has(e.event_type));
+  }
+
+  /** The event whose before/after stills are on show; null clears it. */
+  selectEvent(e) {
+    this.selectedEvent = e;
+    this.dispatchEvent(new CustomEvent("eventselect", { detail: { event: e } }));
   }
 }

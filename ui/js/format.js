@@ -131,3 +131,25 @@ export function toPlotlyLocal(v) {
   if (ms == null) return null;
   return new Date(ms + zoneOffsetMs(ms)).toISOString().replace("T", " ").replace("Z", "");
 }
+
+/** The instant a Plotly date-axis string ("2026-10-19 18:30:00.4") stands for. */
+export function fromPlotlyLocal(str) {
+  if (str == null) return null;
+  const [d, t] = String(str).split(" ");
+  const asUtc = Date.parse(`${d}T${t || "00:00:00"}Z`);
+  if (!Number.isFinite(asUtc)) return null;
+  const guess = asUtc - zoneOffsetMs(asUtc);
+  return asUtc - zoneOffsetMs(guess);
+}
+
+/** Compass heading as "182°". */
+export function fmtDeg(v) {
+  return v == null || Number.isNaN(Number(v)) ? "—" : `${Math.round(Number(v))}°`;
+}
+
+/** "+18 s" / "−12 s" offset of one moment from another. */
+export function fmtOffset(ms, fromMs) {
+  const d = Math.round((ms - fromMs) / 1000);
+  if (d === 0) return "0 s";
+  return `${d > 0 ? "+" : "−"}${Math.abs(d)} s`;
+}

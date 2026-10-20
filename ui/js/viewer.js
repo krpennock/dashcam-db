@@ -3,13 +3,13 @@
 
 import { renderNav } from "./nav.js";
 import { apiGet, toast } from "./api.js";
-import { escapeHtml, fmtClock, fmtUtc, fmtLocalFull, timeHtml, fmtDurationClock, fmtMi, fmtMph, toMs } from "./format.js";
+import { escapeHtml, fmtClock, fmtUtc, fmtLocalFull, fmtDurationShort, fmtMi, fmtMph, fmtDeg, toMs } from "./format.js";
 import { createMap } from "./basemap.js";
 import { DriveState } from "./state.js";
 import { initTrack } from "./track.js";
 import { initStoryboard } from "./storyboard.js";
-import { initEvents, TYPE_ORDER } from "./events.js";
-import { initChart } from "./timeline.js";
+import { initEvents, TYPE_ORDER, typeColor, typeLabel } from "./events.js";
+import { initTimeline } from "./timeline.js";
 import { initDrives } from "./drives.js";
 
 renderNav("viewer", "Dashcam Viewer");
@@ -22,27 +22,29 @@ const map = createMap("map");
 // For poking at the page from the console or a headless check.
 window.__dashcam = { map, state };
 
-initTrack(map, state);
+let story; // assigned below; the track's hover handlers call into it
+const track = initTrack(map, state, {
+  onHover: (ms, point) => story?.hoverAt(ms, point),
+  onHoverEnd: () => story?.hideHover(),
+});
 
-initStoryboard({
-  map, state,
+story = initStoryboard({
+  map, state, track,
   els: {
-    count: $("storyCount"), status: $("storyStatus"), grid: $("thumbGrid"),
-    previewEmpty: $("storyPreviewEmpty"), previewImg: $("storyPreviewImg"),
-    previewTs: $("storyPreviewTs"), openLink: $("storyOpenLink"), reloadBtn: $("storyReloadBtn"),
-  },
-  onReload: () => {
-    const sid = state.session?.drive_session_id;
-    if (sid) loadDrive(sid, { t: state.cursorMs }).catch(err => toast(err.message));
+    strip: $("filmstrip"), count: $("stillCount"),
+    pip: $("pip"), pipImg: $("pipImg"), pipTime: $("pipTime"), pipSpeed: $("pipSpeed"), pipOpen: $("pipOpen"),
+    hoverCard: $("hoverCard"), hoverImg: $("hoverImg"), hoverCap: $("hoverCap"),
+    btnFirst: $("btnFirst"), btnPrev: $("btnPrev"), btnPlay: $("btnPlay"), btnNext: $("btnNext"), btnLast: $("btnLast"),
+    rate: $("rate"),
   },
 });
 
 initEvents({
   map, state,
-  els: { list: $("eventList"), count: $("eventCount"), toggleMap: $("toggleMapEvents") },
+  els: { chips: $("eventChips"), list: $("eventList"), count: $("eventCount"), focus: $("eventFocus") },
 });
 
-initChart({ el: $("chart"), state, toggleEvents: $("toggleChartEvents") });
+const timeline = initTimeline({ el: $("chart"), state });
 
 const drives = initDrives({
   els: {
@@ -52,88 +54,87 @@ const drives = initDrives({
   onSelect: sid => loadDrive(sid).catch(err => toast(err.message)),
 });
 
-// --- Session card and summary card ---
+// --- Drawer: tabs and collapse ---
 
-const elSessionMeta = $("sessionMeta");
+const app = $("app");
+const DRAWER_KEY = "dashcam.drawer";
 
-// A start time that was not measured from satellites is worth flagging, quietly.
+function setDrawer(open) {
+  app.classList.toggle("collapsed", !open);
+  try { localStorage.setItem(DRAWER_KEY, open ? "open" : "closed"); } catch { /* storage blocked */ }
+  requestAnimationFrame(() => { map.resize(); timeline.resize(); });
+}
+$("drawerToggle").addEventListener("click", () => setDrawer(false));
+$("drawerExpand").addEventListener("click", () => setDrawer(true));
+try { if (localStorage.getItem(DRAWER_KEY) === "closed") setDrawer(false); } catch { /* storage blocked */ }
+
+function showTab(name) {
+  for (const b of document.querySelectorAll(".drawer-tabs .tab")) b.classList.toggle("active", b.dataset.tab === name);
+  for (const p of document.querySelectorAll(".tab-panel")) p.classList.toggle("active", p.id === `tab-${name}`);
+}
+document.querySelector(".drawer-tabs").addEventListener("click", e => {
+  const b = e.target.closest(".tab[data-tab]");
+  if (b) showTab(b.dataset.tab);
+});
+state.addEventListener("eventselect", e => { if (e.detail.event) { setDrawer(true); showTab("events"); } });
+
+// --- Summary strip ---
+
+const elStrip = $("summaryStrip");
+
 function approxTimeBadge(tc) {
   if (!tc || !String(tc).startsWith("filename")) return "";
   const why = tc === "filename_estimated_clock_offset"
     ? "Camera clock, corrected using nearby drives"
     : "Camera clock — too few satellite fixes to measure the time";
-  return ` <span class="badge" title="${escapeHtml(why)} (${escapeHtml(tc)})">approximate time</span>`;
+  return `<span class="badge warn" title="${escapeHtml(why)} (${escapeHtml(tc)})">approximate time</span>`;
 }
 
-function setSessionMeta(s) {
+function setStrip(s, sum) {
+  const counts = sum ? [
+    ["hard_brake", sum.hard_brake_count], ["hard_accel", sum.hard_accel_count], ["harsh_turn", sum.harsh_turn_count],
+    ["stop", sum.stops_count], ["bump", sum.bump_count],
+  ].filter(([, n]) => n > 0).map(([t, n]) =>
+    `<span class="count" style="--chip:${typeColor(t)}">${n}× ${escapeHtml(typeLabel(t))}</span>`
+  ).join("") : "";
   const sync = s.time_sync || {};
-  elSessionMeta.innerHTML = `
-    <div><b>Session:</b> <span class="small mono">${escapeHtml(s.drive_session_id)}</span></div>
-    <div><b>Vehicle:</b> <span class="small">${escapeHtml(s.vehicle_tag || "—")}</span></div>
-    <div><b>Start:</b> <span class="small">${timeHtml(s.start_ts_utc)}</span>${approxTimeBadge(s.time_confidence)}</div>
-    <div><b>End:</b> <span class="small">${timeHtml(s.end_ts_utc)}</span></div>
-    <div><b>time_sync:</b> <span class="small">slope=${escapeHtml(sync.slope ?? "—")} p95_ms=${escapeHtml(sync.residual_p95_ms ?? "—")}</span></div>
+  const idTitle = `session ${s.drive_session_id}\nstart ${fmtUtc(s.start_ts_utc)}\nend ${fmtUtc(s.end_ts_utc)}\n` +
+    `time_sync slope=${sync.slope ?? "—"} p95_ms=${sync.residual_p95_ms ?? "—"}` +
+    (sum?.updated_at ? `\nsummary updated ${fmtUtc(sum.updated_at)}` : "");
+  elStrip.innerHTML = `
+    <span class="veh">${escapeHtml(s.vehicle_tag || "—")}</span>
+    <span class="when t" title="${fmtUtc(s.start_ts_utc)}">${escapeHtml(fmtLocalFull(s.start_ts_utc))}</span>
+    ${approxTimeBadge(s.time_confidence)}
+    <span class="stat"><b>${escapeHtml(fmtMi(sum?.distance_mi, 1))}</b></span>
+    <span class="stat"><b>${escapeHtml(fmtDurationShort(sum?.duration_s))}</b></span>
+    <span class="stat">max <b>${escapeHtml(fmtMph(sum?.max_speed_mph))}</b></span>
+    <span class="stat">avg <b>${escapeHtml(fmtMph(sum?.avg_speed_mph))}</b> moving <b>${escapeHtml(fmtMph(sum?.moving_avg_speed_mph))}</b></span>
+    ${counts}
+    ${sum ? "" : `<span class="badge">no summary (run refresh_derived)</span>`}
+    <span class="spacer"></span>
+    <span class="id mono muted" title="${escapeHtml(idTitle)}">${escapeHtml(s.drive_session_id.slice(0, 8))}</span>
   `;
 }
 
-function setSummaryCard(sum) {
-  const set = (id, v) => { $(id).textContent = v; };
-  if (!sum) {
-    set("summaryUpdated", "—");
-    set("sumDistance", "—"); set("sumDuration", "—"); set("sumMaxSpeed", "—"); set("sumAvgSpeed", "—");
-    $("sumCounts").innerHTML = `<span class="badge">Summary not found (run refresh_derived)</span>`;
-    return;
-  }
-  $("summaryUpdated").textContent = sum.updated_at ? `updated ${fmtLocalFull(sum.updated_at)}` : "—";
-  $("summaryUpdated").title = sum.updated_at ? fmtUtc(sum.updated_at) : "";
-  set("sumDistance", fmtMi(sum.distance_mi, 2));
-  set("sumDuration", fmtDurationClock(sum.duration_s));
-  set("sumMaxSpeed", fmtMph(sum.max_speed_mph, 1));
-  set("sumAvgSpeed", `${fmtMph(sum.avg_speed_mph, 1)} / ${fmtMph(sum.moving_avg_speed_mph, 1)}`);
-  $("sumCounts").innerHTML = `
-    <div><b>Stops:</b> ${sum.stops_count ?? 0} &nbsp; <b>Bumps:</b> ${sum.bump_count ?? 0}</div>
-    <div><b>Hard brake:</b> ${sum.hard_brake_count ?? 0} &nbsp; <b>Hard accel:</b> ${sum.hard_accel_count ?? 0} &nbsp; <b>Harsh turn:</b> ${sum.harsh_turn_count ?? 0}</div>
-    ${sum.params ? `
-      <details class="paramsDetails">
-        <summary>params</summary>
-        <pre class="paramsBox">${escapeHtml(JSON.stringify(sum.params, null, 2))}</pre>
-      </details>` : ""}
-  `;
-}
+// --- "Now" line: what the sensors said at the cursor ---
 
-// --- Scrub slider and the "at this moment" panel ---
+const elNow = $("nowLine");
+let clipTimer = null;
+let clipToken = 0;
+let clipText = "";
 
-const slider = $("scrubSlider");
-const elScrubIso = $("scrubIso");
-const elGnssLine = $("nearGnss");
-const elAccelLine = $("nearAccel");
-const elClipLine = $("nearClip");
-
-slider.addEventListener("input", () => state.setCursor(Number(slider.value), "scrub"));
-
-function enableScrub() {
-  slider.min = String(state.startMs);
-  slider.max = String(state.endMs);
-  slider.step = "200";
-  slider.value = String(state.startMs);
-  slider.disabled = !(state.startMs != null && state.endMs != null && state.endMs > state.startMs);
-}
-
-function updateNearestInfo(ms) {
+function renderNow(ms) {
   const g = state.nearestGnss(ms);
   const a = state.nearestAccel(ms);
-  elGnssLine.innerHTML = g
-    ? `${timeHtml(g.ts_utc, { full: false })}  (${g.lat.toFixed(6)}, ${g.lon.toFixed(6)})  ${fmtMph(g.speed_mph)}`
-    : "—";
-  elAccelLine.innerHTML = a && a.a_mag_raw != null
-    ? `${timeHtml(a.ts_utc, { full: false })}  mag=${a.a_mag_raw.toFixed(2)}  ax=${a.ax.toFixed(2)} ay=${a.ay.toFixed(2)} az=${a.az.toFixed(2)}`
-    : "—";
+  const parts = [`<span class="t" title="${fmtUtc(ms)}">${escapeHtml(fmtClock(ms, { seconds: true }))}</span>`];
+  if (g) parts.push(escapeHtml(fmtMph(g.speed_mph)), `heading ${escapeHtml(fmtDeg(g.course_deg))}`);
+  if (a?.a_mag_raw != null) parts.push(`${a.a_mag_raw.toFixed(2)} g`);
+  if (clipText) parts.push(`<span class="mono">${escapeHtml(clipText)}</span>`);
+  elNow.innerHTML = parts.join(`<span class="sep">·</span>`);
 }
 
 // The clip name is the one thing the browser cannot work out itself; ask for
 // it once the cursor has stopped moving.
-let clipTimer = null;
-let clipToken = 0;
 function scheduleClipLookup(ms) {
   if (clipTimer) clearTimeout(clipTimer);
   const token = ++clipToken;
@@ -143,12 +144,9 @@ function scheduleClipLookup(ms) {
     try {
       const data = await apiGet(`/sessions/${sid}/nearest`, { ts: new Date(ms).toISOString() });
       if (token !== clipToken || state.session?.drive_session_id !== sid) return;
-      const c = data.clip;
-      elClipLine.innerHTML = c
-        ? `<span class="mono">${escapeHtml(c.clip_name)}</span>  (${fmtClock(c.start_ts_utc, { seconds: true })} → ${fmtClock(c.end_ts_utc, { seconds: true })})`
-        : "—";
+      clipText = data.clip ? data.clip.clip_name : "";
+      renderNow(state.cursorMs);
     } catch (err) {
-      if (token === clipToken) elClipLine.textContent = "—";
       console.warn("clip lookup failed", err);
     }
   }, 300);
@@ -170,21 +168,15 @@ function scheduleUrlUpdate() {
 }
 
 state.addEventListener("cursorchange", e => {
-  const { ms, source } = e.detail;
-  if (source !== "scrub") slider.value = String(ms);
-  elScrubIso.textContent = fmtClock(ms, { seconds: true });
-  elScrubIso.title = fmtUtc(ms);
-  updateNearestInfo(ms);
-  scheduleClipLookup(ms);
+  renderNow(e.detail.ms);
+  scheduleClipLookup(e.detail.ms);
   scheduleUrlUpdate();
 });
 
 state.addEventListener("clear", () => {
-  slider.disabled = true;
-  elScrubIso.textContent = "—";
-  elGnssLine.textContent = "—";
-  elAccelLine.textContent = "—";
-  elClipLine.textContent = "—";
+  clipText = "";
+  elNow.textContent = "—";
+  elStrip.innerHTML = `<span class="muted">Loading…</span>`;
 });
 
 // --- Loading a drive ---
@@ -194,7 +186,6 @@ let loadToken = 0;
 async function loadDrive(sid, { t = null } = {}) {
   const token = ++loadToken;
   state.clear();
-  elSessionMeta.innerHTML = `<div><b>Session:</b> <span class="small">loading…</span></div>`;
 
   const [session, summary, gnss, frames, events, accel] = await Promise.all([
     apiGet(`/sessions/${sid}`),
@@ -207,9 +198,7 @@ async function loadDrive(sid, { t = null } = {}) {
   if (token !== loadToken) return; // a newer drive was picked meanwhile
 
   state.load({ session, summary, gnss, frames, events, accel });
-  setSessionMeta(session);
-  setSummaryCard(summary);
-  enableScrub();
+  setStrip(session, summary);
   state.setCursor(t ?? state.startMs, "load");
 }
 

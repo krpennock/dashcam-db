@@ -15,9 +15,15 @@
 <body>
   <header></header>
 
-  <div class="grid">
-    <div class="left">
-      <div class="card">
+  <div class="app" id="app">
+    <aside class="drawer" id="drawer">
+      <div class="drawer-tabs">
+        <button type="button" class="tab active" data-tab="drives">Drives</button>
+        <button type="button" class="tab" data-tab="events">Events <span class="n" id="eventCount"></span></button>
+        <button type="button" class="drawer-collapse" id="drawerToggle" title="Hide the side panel">◀</button>
+      </div>
+
+      <section class="tab-panel active" id="tab-drives">
         <div class="session-filters">
           <label>Vehicle
             <select id="vehicleFilter"><option value="">All</option></select>
@@ -25,7 +31,7 @@
           <label>From <input type="date" id="dateFrom" /></label>
           <label>To <input type="date" id="dateTo" /></label>
         </div>
-        <div class="session-table-wrap">
+        <div class="session-table-wrap grow">
           <table class="session-table">
             <thead>
               <tr>
@@ -39,80 +45,59 @@
           </table>
         </div>
         <div class="session-status" id="sessionStatus">Loading&hellip;</div>
-        <div class="kv" id="sessionMeta" style="margin-top:10px;">
-          <div><b>Session:</b> <span class="small">none loaded</span></div>
-        </div>
-      </div>
+      </section>
 
-      <div class="card" id="summaryCard">
-        <div class="row" style="justify-content:space-between;">
-          <div><b>Summary</b></div>
-          <div class="small" id="summaryUpdated">—</div>
-        </div>
-        <div class="split" id="summaryGrid">
-          <div class="kcell"><div class="k">Distance</div><div class="v" id="sumDistance">—</div></div>
-          <div class="kcell"><div class="k">Duration</div><div class="v" id="sumDuration">—</div></div>
-          <div class="kcell"><div class="k">Max speed</div><div class="v" id="sumMaxSpeed">—</div></div>
-          <div class="kcell"><div class="k">Avg / Moving avg</div><div class="v" id="sumAvgSpeed">—</div></div>
-        </div>
-        <div class="kv" style="margin-top:10px;" id="sumCounts">—</div>
-      </div>
+      <section class="tab-panel" id="tab-events">
+        <div class="chips" id="eventChips"></div>
+        <div class="event-focus" id="eventFocus" hidden></div>
+        <div class="events grow" id="eventList"></div>
+      </section>
+    </aside>
 
-      <div class="card scrub">
-        <div class="row" style="justify-content:space-between;">
-          <div><b>Scrub</b></div>
-          <div class="time" id="scrubIso">—</div>
-        </div>
-        <input id="scrubSlider" type="range" min="0" max="0" step="200" value="0" disabled />
-        <div class="kv" id="nearestInfo">
-          <div><b>GNSS:</b> <span class="small" id="nearGnss">—</span></div>
-          <div><b>Accel:</b> <span class="small" id="nearAccel">—</span></div>
-          <div><b>Clip:</b> <span class="small" id="nearClip">—</span></div>
-        </div>
-      </div>
+    <button type="button" class="rail" id="drawerExpand" title="Show the side panel">▶</button>
 
-      <div class="card" id="storyCard">
-        <div class="row" style="justify-content:space-between;">
-          <div><b>Storyboard</b> <span class="small" id="storyCount">—</span></div>
-          <button id="storyReloadBtn" disabled>Reload</button>
-        </div>
-        <div class="kv" style="margin-top:6px;">
-          <span class="badge">click a frame to jump</span>
-          <span class="small" id="storyStatus" style="margin-left:8px;">—</span>
-        </div>
+    <main class="main">
+      <div class="strip" id="summaryStrip"><span class="muted">Pick a drive from the list.</span></div>
 
-        <div class="storyPreview" id="storyPreviewWrap">
-          <div class="small" id="storyPreviewEmpty">No frame selected</div>
-          <img id="storyPreviewImg" alt="" style="display:none;" />
+      <div class="map-wrap">
+        <div id="map"></div>
+        <div class="legend" id="speedLegend" title="Route colour is speed">
+          <span>0</span><span class="bar"></span><span>60+ mph</span>
         </div>
-        <div class="row" style="justify-content:space-between; margin-top:8px;">
-          <div class="small t" id="storyPreviewTs">—</div>
-          <a class="small" id="storyOpenLink" href="#" target="_blank" style="color:var(--muted); text-decoration:none; display:none;">open</a>
-        </div>
-
-        <div class="thumbGrid" id="thumbGrid"></div>
-      </div>
-
-      <div class="card">
-        <div class="row" style="justify-content:space-between;">
-          <div class="controls">
-            <div><b>Events</b> <span class="small" id="eventCount">—</span></div>
-            <label class="toggle"><input type="checkbox" id="toggleMapEvents" checked />Map dots</label>
-            <label class="toggle"><input type="checkbox" id="toggleChartEvents" />Chart markers</label>
+        <div class="pip" id="pip" hidden>
+          <img id="pipImg" alt="" />
+          <div class="pip-cap">
+            <span class="t mono" id="pipTime"></span>
+            <span class="muted" id="pipSpeed"></span>
+            <a id="pipOpen" href="#" target="_blank" title="Open the full-size still">open</a>
           </div>
         </div>
-        <div class="events" id="eventList"></div>
+        <div class="hovercard" id="hoverCard" hidden>
+          <img id="hoverImg" alt="" />
+          <div class="cap mono" id="hoverCap"></div>
+        </div>
       </div>
-    </div>
 
-    <div class="right">
-      <div class="card" style="padding:0;">
-        <div id="map"></div>
+      <div class="filmstrip-bar">
+        <div class="transport">
+          <button type="button" id="btnFirst" title="First still (Home)" disabled>|◀</button>
+          <button type="button" id="btnPrev" title="Previous still (←)" disabled>◀</button>
+          <button type="button" id="btnPlay" class="play" title="Play (Space)" disabled>▶</button>
+          <button type="button" id="btnNext" title="Next still (→)" disabled>▶</button>
+          <button type="button" id="btnLast" title="Last still (End)" disabled>▶|</button>
+          <select id="rate" title="Playback speed">
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+          <span class="small" id="stillCount">—</span>
+          <span class="now" id="nowLine">—</span>
+        </div>
+        <div class="filmstrip" id="filmstrip"></div>
       </div>
-      <div class="card" style="padding:0;">
-        <div id="chart"></div>
-      </div>
-    </div>
+
+      <div class="timeline"><div id="chart"></div></div>
+    </main>
   </div>
 
   <script type="module" src="js/viewer.js"></script>

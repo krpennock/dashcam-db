@@ -1,34 +1,38 @@
-// The accelerometer chart under the map, with the cursor and event ticks.
+// The timeline band under the filmstrip: speed and accelerometer magnitude
+// against time, event ticks, and the cursor. Click or drag on it to seek.
 
-import { toPlotlyLocal } from "./format.js";
+import { toPlotlyLocal, fromPlotlyLocal } from "./format.js";
 import { typeColor } from "./events.js";
 
-const CONFIG = { displayModeBar: false, responsive: true };
+const CONFIG = { displayModeBar: false, responsive: true, doubleClick: false, scrollZoom: false };
 
 function baseLayout() {
   return {
-    margin: { l: 50, r: 20, t: 16, b: 45 },
+    margin: { l: 44, r: 44, t: 10, b: 32 },
     paper_bgcolor: "rgba(0,0,0,0)",
     plot_bgcolor: "rgba(0,0,0,0)",
     font: { color: "#9fb0c0", size: 11 },
-    xaxis: { title: { text: "Time (local)" }, gridcolor: "#253244", zerolinecolor: "#253244" },
-    yaxis: { title: { text: "Accel (g)" }, gridcolor: "#253244", zerolinecolor: "#253244" },
-    legend: { bgcolor: "rgba(0,0,0,0)" },
-    showlegend: true,
+    xaxis: { gridcolor: "#253244", zerolinecolor: "#253244", fixedrange: true },
+    yaxis: { title: { text: "mph", standoff: 6 }, gridcolor: "#253244", zerolinecolor: "#253244", rangemode: "tozero", fixedrange: true },
+    yaxis2: { title: { text: "g", standoff: 6 }, overlaying: "y", side: "right", showgrid: false, rangemode: "tozero", fixedrange: true },
+    showlegend: false,
+    hovermode: "x",
+    dragmode: false,
     shapes: [],
   };
 }
 
-export function initChart({ el, state, toggleEvents }) {
+export function initTimeline({ el, state }) {
   let ready = false;
   let eventShapes = [];
   let cursorX = null;
   let drawTimer = null;
+  let dragging = false;
 
   const readyPromise = Plotly.newPlot(el, [], baseLayout(), CONFIG).then(() => { ready = true; });
 
   function shapes() {
-    const out = toggleEvents.checked ? [...eventShapes] : [];
+    const out = eventShapes.filter(s => state.isTypeVisible(s.__type));
     if (cursorX) {
       out.push({
         type: "line", xref: "x", yref: "paper",
@@ -39,7 +43,7 @@ export function initChart({ el, state, toggleEvents }) {
     return out;
   }
 
-  /** Redraw the shapes soon. Several cursor moves inside 80 ms become one redraw. */
+  /** Several cursor moves inside 80 ms become one redraw. */
   function scheduleDraw() {
     if (drawTimer) return;
     drawTimer = setTimeout(() => {
@@ -48,22 +52,37 @@ export function initChart({ el, state, toggleEvents }) {
     }, 80);
   }
 
-  toggleEvents.addEventListener("change", scheduleDraw);
+  function seekTo(x) {
+    const ms = fromPlotlyLocal(x);
+    if (ms != null) state.setCursor(ms, "timeline");
+  }
+
+  readyPromise.then(() => {
+    el.on("plotly_click", ev => { const p = ev.points?.[0]; if (p) seekTo(p.x); });
+    el.on("plotly_hover", ev => { const p = ev.points?.[0]; if (dragging && p) seekTo(p.x); });
+  });
+  el.addEventListener("mousedown", e => { if (e.button === 0) dragging = true; });
+  window.addEventListener("mouseup", () => { dragging = false; });
 
   state.addEventListener("load", async () => {
     await readyPromise;
-    const x = state.accelMs.map(toPlotlyLocal);
-    const col = k => state.accel.map(p => p[k]);
+    const xs = state.gnssMs.map(toPlotlyLocal);
+    const xa = state.accelMs.map(toPlotlyLocal);
     const traces = [
-      { x, y: col("a_mag_raw"), mode: "lines", name: "magnitude", type: "scattergl", line: { color: "#4dabf7", width: 1 } },
-      { x, y: col("ax"), mode: "lines", name: "ax", type: "scattergl", visible: "legendonly", line: { width: 1 } },
-      { x, y: col("ay"), mode: "lines", name: "ay", type: "scattergl", visible: "legendonly", line: { width: 1 } },
-      { x, y: col("az"), mode: "lines", name: "az", type: "scattergl", visible: "legendonly", line: { width: 1 } },
+      {
+        x: xs, y: state.gnss.map(g => g.speed_mph), type: "scattergl", mode: "lines", name: "speed",
+        line: { color: "#69db7c", width: 1.5 }, hovertemplate: "%{y:.0f} mph<extra></extra>",
+      },
+      {
+        x: xa, y: state.accel.map(a => a.a_mag_raw), type: "scattergl", mode: "lines", name: "accel",
+        yaxis: "y2", line: { color: "#4dabf7", width: 1 }, opacity: 0.6, hovertemplate: "%{y:.2f} g<extra></extra>",
+      },
     ];
     eventShapes = state.events.map(e => ({
+      __type: e.event_type,
       type: "line", xref: "x", yref: "paper",
       x0: toPlotlyLocal(e.ts_utc), x1: toPlotlyLocal(e.ts_utc), y0: 0, y1: 1,
-      line: { width: 1, dash: "dot", color: typeColor(e.event_type) },
+      line: { width: 1.5, dash: "dot", color: typeColor(e.event_type) },
     }));
     cursorX = toPlotlyLocal(state.cursorMs);
     const layout = baseLayout();
@@ -86,4 +105,10 @@ export function initChart({ el, state, toggleEvents }) {
     cursorX = toPlotlyLocal(e.detail.ms);
     scheduleDraw();
   });
+
+  state.addEventListener("eventfilter", scheduleDraw);
+
+  return {
+    resize() { if (ready) Plotly.Plots.resize(el); },
+  };
 }
