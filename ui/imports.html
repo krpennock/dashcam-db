@@ -5,66 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Imports — Dashcam</title>
 
-  <style>
-    :root { --bg:#0b0f14; --panel:#111823; --text:#e6edf3; --muted:#9fb0c0; --border:#253244; --danger:#ff6b6b; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
-    header { padding:12px 16px; border-bottom:1px solid var(--border); display:flex; gap:12px; align-items:center; }
-    header .title { font-weight:650; }
-    header .muted { color:var(--muted); font-size:12px; }
-    header .nav { display:flex; gap:6px; align-items:center; font-size:12px; }
-    header .nav a { color:var(--muted); text-decoration:none; padding:2px 8px; border-radius:8px; }
-    header .nav a:hover { color:var(--text); }
-    header .nav a.current { color:var(--text); background:rgba(255,255,255,0.06); }
-    header .nav .sep { color:var(--border); }
-
-    .wrap { padding:12px; box-sizing:border-box; max-width:1100px; }
-    .card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:12px; box-sizing:border-box; }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .kv { font-size:12px; color:var(--muted); line-height:1.45; }
-    .kv b { color:var(--text); font-weight:600; }
-    .small { font-size:12px; color:var(--muted); }
-    .pill { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:12px; }
-    .badge { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; font-size:11px; color:var(--muted); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-
-    /* Same table language as the session browser in index.html */
-    .session-table { width:100%; border-collapse:collapse; font-size:12px; }
-    .session-table th { position:sticky; top:0; background:var(--panel); color:var(--muted); font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); }
-    .session-table td { padding:7px 8px; border-bottom:1px solid var(--border); white-space:nowrap; vertical-align:top; }
-    .session-table tr.batch { cursor:pointer; }
-    .session-table tbody tr.batch:hover { background:rgba(255,255,255,0.04); }
-    .session-table tbody tr.batch.open { background:rgba(100,180,255,0.12); }
-
-    .caret { display:inline-block; width:10px; color:var(--muted); transition:transform .12s ease; }
-    tr.batch.open .caret { transform:rotate(90deg); color:var(--text); }
-
-    .detail > td { padding:0 8px 12px 8px; border-bottom:1px solid var(--border); background:rgba(0,0,0,0.12); white-space:normal; }
-    .drives { width:100%; border-collapse:collapse; font-size:12px; margin-top:4px; }
-    .drives th { color:var(--muted); font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.5px; padding:6px 8px; text-align:left; border-bottom:1px solid var(--border); }
-    .drives td { padding:6px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
-    .drives tr:last-child td { border-bottom:none; }
-    .drives a { color:#4dabf7; text-decoration:none; }
-    .drives a:hover { text-decoration:underline; }
-    .reason { color:var(--text); }
-    .counts { color:var(--muted); font-size:11px; }
-    .code { font-size:10px; opacity:.75; }
-    .empty { padding:18px 8px; color:var(--muted); font-size:13px; }
-    .err { color:var(--danger); font-size:12px; }
-    .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
-    .filters label { font-size:11px; color:var(--muted); }
-    select { font:inherit; font-size:12px; padding:5px 8px; background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:10px; }
-  </style>
+  <link rel="stylesheet" href="css/app.css" />
+  <link rel="stylesheet" href="css/imports.css" />
 </head>
 <body>
-  <header>
-    <div class="title">Imports <span class="pill">v0.4</span></div>
-    <nav class="nav">
-      <a href="index.html">Viewer</a>
-      <span class="sep">|</span>
-      <a href="imports.html" class="current" aria-current="page">Imports</a>
-    </nav>
-    <div class="muted" id="statusLine">Loading&hellip;</div>
-  </header>
+  <header></header>
 
   <div class="wrap">
     <div class="card">
@@ -105,7 +50,10 @@
     </div>
   </div>
 
-<script>
+<script type="module">
+import { renderNav } from "./js/nav.js";
+import { fmtLocal } from "./js/format.js";
+renderNav("imports", "Imports", { status: "Loading…" });
 (() => {
   const API = `/api`;
   const REFRESH_MS = 15000;
@@ -141,14 +89,7 @@
 
   // Same shape as fmtDate in index.html: local (America/Chicago) "Apr 16 1:18p"
   function fmtDate(iso) {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "—";
-    const mon = d.toLocaleString("en-US", { month: "short", timeZone: "America/Chicago" });
-    const day = d.toLocaleString("en-US", { day: "numeric", timeZone: "America/Chicago" });
-    let hr = d.toLocaleString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Chicago" });
-    hr = hr.replace(/ AM/, "a").replace(/ PM/, "p");
-    return `${mon} ${day} ${hr}`;
+    return fmtLocal(iso);
   }
 
   // Fallback when a drive never became a session: the time in its folder name.

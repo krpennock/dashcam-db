@@ -1,0 +1,28 @@
+/* The Imports page: batch table with expandable per-drive detail. */
+
+.wrap { padding: 12px; box-sizing: border-box; max-width: 1100px; }
+
+.session-table td { padding: 7px 8px; vertical-align: top; }
+.session-table tbody tr { cursor: default; }
+.session-table tbody tr:hover { background: none; }
+.session-table tr.batch { cursor: pointer; }
+.session-table tbody tr.batch:hover { background: rgba(255, 255, 255, 0.04); }
+.session-table tbody tr.batch.open { background: rgba(100, 180, 255, 0.12); }
+
+.caret { display: inline-block; width: 10px; color: var(--muted); transition: transform .12s ease; }
+tr.batch.open .caret { transform: rotate(90deg); color: var(--text); }
+
+.detail > td { padding: 0 8px 12px 8px; border-bottom: 1px solid var(--border); background: rgba(0, 0, 0, 0.12); white-space: normal; }
+.drives { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+.drives th { color: var(--muted); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+.drives td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.drives tr:last-child td { border-bottom: none; }
+.drives a { color: var(--accent); text-decoration: none; }
+.drives a:hover { text-decoration: underline; }
+.reason { color: var(--text); }
+.counts { color: var(--muted); font-size: 11px; }
+.code { font-size: 10px; opacity: .75; }
+.empty { padding: 18px 8px; color: var(--muted); font-size: 13px; }
+.filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.filters label { font-size: 11px; color: var(--muted); }
+.filters select { font-size: 12px; padding: 5px 8px; }

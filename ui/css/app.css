@@ -1,0 +1,101 @@
+/* Shared look for every page: colours, header, controls, cards, tables. */
+
+:root {
+  --bg: #0b0f14;
+  --panel: #111823;
+  --text: #e6edf3;
+  --muted: #9fb0c0;
+  --border: #253244;
+  --accent: #4dabf7;
+  --danger: #ff6b6b;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+header .title { font-weight: 650; }
+header .muted { color: var(--muted); font-size: 12px; }
+header .nav { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+header .nav a { color: var(--muted); text-decoration: none; padding: 2px 8px; border-radius: 8px; }
+header .nav a:hover { color: var(--text); }
+header .nav a.current { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+header .nav .sep { color: var(--border); }
+
+select, button, input { font: inherit; }
+select, button, input[type="date"], input[type="number"], input[type="text"] {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 10px;
+}
+button { cursor: pointer; }
+button:disabled { opacity: 0.55; cursor: not-allowed; }
+a { color: var(--accent); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 12px;
+  box-sizing: border-box;
+}
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.kv { font-size: 12px; color: var(--muted); line-height: 1.45; }
+.kv b { color: var(--text); font-weight: 600; }
+.small { font-size: 12px; color: var(--muted); }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.pill { display: inline-block; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); font-size: 12px; }
+.badge { display: inline-block; padding: 2px 8px; border: 1px solid var(--border); border-radius: 999px; font-size: 11px; color: var(--muted); }
+.err { color: var(--danger); font-size: 12px; }
+
+/* A moment in time: local shown, UTC in the tooltip. */
+.t { cursor: default; }
+
+/* Drive tables (viewer list, imports) */
+.session-filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.session-filters select, .session-filters input[type="date"] { font-size: 12px; padding: 5px 8px; }
+.session-filters label { font-size: 11px; color: var(--muted); }
+.session-table-wrap { max-height: 260px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }
+.session-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.session-table th {
+  position: sticky; top: 0;
+  background: var(--panel); color: var(--muted);
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px;
+  padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+.session-table th[data-col] { cursor: pointer; }
+.session-table th[data-col]:hover { color: var(--text); }
+.session-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.session-table tbody tr { cursor: pointer; }
+.session-table tbody tr:hover { background: rgba(255, 255, 255, 0.04); }
+.session-table tbody tr.active { background: rgba(100, 180, 255, 0.12); }
+.session-status { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+/* Messages */
+#toasts {
+  position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 8px; z-index: 1000; max-width: min(640px, 90vw);
+}
+.toast {
+  display: flex; gap: 12px; align-items: center;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 10px 12px; font-size: 13px; box-shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+.toast-error { border-color: var(--danger); }
+.toast-info { border-color: var(--accent); }
+.toast button { padding: 0 6px; border: none; background: none; color: var(--muted); font-size: 16px; }
+.toast button:hover { color: var(--text); }
